@@ -9,7 +9,35 @@ SHLIB_LINK = $(libpq)
 EXTENSION = jdbc2_fdw
 DATA = jdbc2_fdw--1.0.sql
 
-REGRESS = jdbc2s_fdw
+REGRESS = jdbc2_fdw
+
+JDBC_CONFIG = jdbc_config
+
+SHLIB_LINK = -ljvm
+
+UNAME = $(shell uname)
+
+# Special treatment for Mac OS X
+ifeq ($(UNAME), Darwin)
+#	SHLIB_LINK = -I/System/Library/Frameworks/JavaVM.framework/Headers -L/System/Library/Frameworks/JavaVM.framework/Libraries -ljvm -framework JavaVM
+	SHLIB_LINK = -I$(JAVA_HOME)/include -L$(JAVA_HOME)/jre/lib -ljvm -framework JavaVM
+endif
+
+
+TRGTS = JAVAFILES
+
+JAVA_SOURCES = \
+	JDBCUtils.java \
+	JDBCDriverLoader.java \
+ 
+PG_CPPFLAGS=-D'PKG_LIB_DIR=$(pkglibdir)'
+
+JFLAGS = -d $(pkglibdir)
+
+# all:$(TRGTS)
+
+JAVAFILES:
+	javac $(JFLAGS) $(JAVA_SOURCES)
 
 # the db name is hard-coded in the tests
 override USE_MODULE_DB =
