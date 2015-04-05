@@ -1,12 +1,12 @@
 /*-------------------------------------------------------------------------
  *
  * option.c
- *		  FDW option handling for jdbc2_fdw
+ *        FDW option handling for jdbc2_fdw
  *
  * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *		  contrib/jdbc2_fdw/option.c
+ *        contrib/jdbc2_fdw/option.c
  *
  *-------------------------------------------------------------------------
  */
@@ -24,29 +24,29 @@
 /*
  * Describes the valid options for objects that this wrapper uses.
  */
-typedef struct PgFdwOption
+typedef struct JdbcFdwOption
 {
-	const char *keyword;
-	Oid			optcontext;		/* OID of catalog in which option may appear */
-	bool		is_libpq_opt;	/* true if it's used in libpq */
-} PgFdwOption;
+    const char *keyword;
+    Oid         optcontext;     /* OID of catalog in which option may appear */
+    bool        is_libpq_opt;   /* true if it's used in libpq */
+} JdbcFdwOption;
 
 /*
  * Valid options for jdbc2_fdw.
- * Allocated and filled in InitPgFdwOptions.
+ * Allocated and filled in InitJdbcFdwOptions.
  */
-static PgFdwOption *jdbc2_fdw_options;
+static JdbcFdwOption *jdbc2_fdw_options;
 
 /*
  * Valid options for libpq.
- * Allocated and filled in InitPgFdwOptions.
+ * Allocated and filled in InitJdbcFdwOptions.
  */
 static PQconninfoOption *libpq_options;
 
 /*
  * Helper functions
  */
-static void InitPgFdwOptions(void);
+static void InitJdbcFdwOptions(void);
 static bool is_valid_option(const char *keyword, Oid context);
 static bool is_libpq_option(const char *keyword);
 
@@ -62,167 +62,174 @@ PG_FUNCTION_INFO_V1(jdbc2_fdw_validator);
 Datum
 jdbc2_fdw_validator(PG_FUNCTION_ARGS)
 {
-	List	   *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
-	Oid			catalog = PG_GETARG_OID(1);
-	ListCell   *cell;
+    List       *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
+    Oid         catalog = PG_GETARG_OID(1);
+    ListCell   *cell;
 
-	/* Build our options lists if we didn't yet. */
-	InitPgFdwOptions();
+    /* Build our options lists if we didn't yet. */
+    InitJdbcFdwOptions();
 
-	/*
-	 * Check that only options supported by jdbc2_fdw, and allowed for the
-	 * current object type, are given.
-	 */
-	foreach(cell, options_list)
-	{
-		DefElem    *def = (DefElem *) lfirst(cell);
+    /*
+     * Check that only options supported by jdbc2_fdw, and allowed for the
+     * current object type, are given.
+     */
+    foreach(cell, options_list)
+    {
+        DefElem    *def = (DefElem *) lfirst(cell);
 
-		if (!is_valid_option(def->defname, catalog))
-		{
-			/*
-			 * Unknown option specified, complain about it. Provide a hint
-			 * with list of valid options for the object.
-			 */
-			PgFdwOption *opt;
-			StringInfoData buf;
+        if (!is_valid_option(def->defname, catalog))
+        {
+            /*
+             * Unknown option specified, complain about it. Provide a hint
+             * with list of valid options for the object.
+             */
+            JdbcFdwOption *opt;
+            StringInfoData buf;
 
-			initStringInfo(&buf);
-			for (opt = jdbc2_fdw_options; opt->keyword; opt++)
-			{
-				if (catalog == opt->optcontext)
-					appendStringInfo(&buf, "%s%s", (buf.len > 0) ? ", " : "",
-									 opt->keyword);
-			}
+            initStringInfo(&buf);
+            for (opt = jdbc2_fdw_options; opt->keyword; opt++)
+            {
+                if (catalog == opt->optcontext)
+                    appendStringInfo(&buf, "%s%s", (buf.len > 0) ? ", " : "",
+                                     opt->keyword);
+            }
 
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-					 errmsg("invalid option \"%s\"", def->defname),
-					 errhint("Valid options in this context are: %s",
-							 buf.data)));
-		}
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                     errmsg("invalid option \"%s\"", def->defname),
+                     errhint("Valid options in this context are: %s",
+                             buf.data)));
+        }
 
-		/*
-		 * Validate option value, when we can do so without any context.
-		 */
-		if (strcmp(def->defname, "use_remote_estimate") == 0 ||
-			strcmp(def->defname, "updatable") == 0)
-		{
-			/* these accept only boolean values */
-			(void) defGetBoolean(def);
-		}
-		else if (strcmp(def->defname, "fdw_startup_cost") == 0 ||
-				 strcmp(def->defname, "fdw_tuple_cost") == 0)
-		{
-			/* these must have a non-negative numeric value */
-			double		val;
-			char	   *endp;
+        /*
+         * Validate option value, when we can do so without any context.
+         */
+        if (strcmp(def->defname, "use_remote_estimate") == 0 ||
+            strcmp(def->defname, "updatable") == 0)
+        {
+            /* these accept only boolean values */
+            (void) defGetBoolean(def);
+        }
+        else if (strcmp(def->defname, "fdw_startup_cost") == 0 ||
+                 strcmp(def->defname, "fdw_tuple_cost") == 0)
+        {
+            /* these must have a non-negative numeric value */
+            double      val;
+            char       *endp;
 
-			val = strtod(defGetString(def), &endp);
-			if (*endp || val < 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("%s requires a non-negative numeric value",
-								def->defname)));
-		}
-	}
+            val = strtod(defGetString(def), &endp);
+            if (*endp || val < 0)
+                ereport(ERROR,
+                        (errcode(ERRCODE_SYNTAX_ERROR),
+                         errmsg("%s requires a non-negative numeric value",
+                                def->defname)));
+        }
+    }
 
-	PG_RETURN_VOID();
+    PG_RETURN_VOID();
 }
 
 /*
  * Initialize option lists.
  */
 static void
-InitPgFdwOptions(void)
+InitJdbcFdwOptions(void)
 {
-	int			num_libpq_opts;
-	PQconninfoOption *lopt;
-	PgFdwOption *popt;
+    int num_libpq_opts;
+    PQconninfoOption *lopt;
+    JdbcFdwOption *popt;
 
-	/* non-libpq FDW-specific FDW options */
-	static const PgFdwOption non_libpq_options[] = {
-		{"schema_name", ForeignTableRelationId, false},
-		{"table_name", ForeignTableRelationId, false},
-		{"column_name", AttributeRelationId, false},
-		/* use_remote_estimate is available on both server and table */
-		{"use_remote_estimate", ForeignServerRelationId, false},
-		{"use_remote_estimate", ForeignTableRelationId, false},
-		/* cost factors */
-		{"fdw_startup_cost", ForeignServerRelationId, false},
-		{"fdw_tuple_cost", ForeignServerRelationId, false},
-		/* updatable is available on both server and table */
-		{"updatable", ForeignServerRelationId, false},
-		{"updatable", ForeignTableRelationId, false},
-		{NULL, InvalidOid, false}
-	};
+    /* non-libpq FDW-specific FDW options */
+    static const JdbcFdwOption non_libpq_options[] = {
+        /* Connection options */
+        { "drivername",         ForeignServerRelationId, false },
+        { "url",                ForeignServerRelationId, false },
+        { "querytimeout",       ForeignServerRelationId, false },
+        { "jarfile",            ForeignServerRelationId, false },
+        { "maxheapsize",        ForeignServerRelationId, false },
+        { "username",           UserMappingRelationId, false },
+        { "password",           UserMappingRelationId, false },
+        { "query",              ForeignTableRelationId, false },
+        { "table",              ForeignTableRelationId, false },
+        /* use_remote_estimate is available on both server and table */
+        {"use_remote_estimate", ForeignServerRelationId, false},
+        {"use_remote_estimate", ForeignTableRelationId, false},
+        /* cost factors */
+        {"fdw_startup_cost", ForeignServerRelationId, false},
+        {"fdw_tuple_cost", ForeignServerRelationId, false},
+        /* updatable is available on both server and table */
+        {"updatable", ForeignServerRelationId, false},
+        {"updatable", ForeignTableRelationId, false},
+        {NULL, InvalidOid, false}
+    };
 
-	/* Prevent redundant initialization. */
-	if (jdbc2_fdw_options)
-		return;
+    /* Prevent redundant initialization. */
+    if (jdbc2_fdw_options)
+        return;
 
-	/*
-	 * Get list of valid libpq options.
-	 *
-	 * To avoid unnecessary work, we get the list once and use it throughout
-	 * the lifetime of this backend process.  We don't need to care about
-	 * memory context issues, because PQconndefaults allocates with malloc.
-	 */
-	libpq_options = PQconndefaults();
-	if (!libpq_options)			/* assume reason for failure is OOM */
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-				 errmsg("out of memory"),
-			 errdetail("could not get libpq's default connection options")));
+    /*
+     * Get list of valid libpq options.
+     *
+     * To avoid unnecessary work, we get the list once and use it throughout
+     * the lifetime of this backend process.  We don't need to care about
+     * memory context issues, because PQconndefaults allocates with malloc.
+     */
+    libpq_options = PQconndefaults();
+    if (!libpq_options)         /* assume reason for failure is OOM */
+        ereport(ERROR,
+                (errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+                 errmsg("out of memory"),
+             errdetail("could not get libpq's default connection options")));
 
-	/* Count how many libpq options are available. */
-	num_libpq_opts = 0;
-	for (lopt = libpq_options; lopt->keyword; lopt++)
-		num_libpq_opts++;
+    /* Count how many libpq options are available. */
+    num_libpq_opts = 0;
+    for (lopt = libpq_options; lopt->keyword; lopt++)
+        num_libpq_opts++;
 
-	/*
-	 * Construct an array which consists of all valid options for
-	 * jdbc2_fdw, by appending FDW-specific options to libpq options.
-	 *
-	 * We use plain malloc here to allocate jdbc2_fdw_options because it
-	 * lives as long as the backend process does.  Besides, keeping
-	 * libpq_options in memory allows us to avoid copying every keyword
-	 * string.
-	 */
-	jdbc2_fdw_options = (PgFdwOption *)
-		malloc(sizeof(PgFdwOption) * num_libpq_opts +
-			   sizeof(non_libpq_options));
-	if (jdbc2_fdw_options == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
-				 errmsg("out of memory")));
+    /*
+     * Construct an array which consists of all valid options for
+     * jdbc2_fdw, by appending FDW-specific options to libpq options.
+     *
+     * We use plain malloc here to allocate jdbc2_fdw_options because it
+     * lives as long as the backend process does.  Besides, keeping
+     * libpq_options in memory allows us to avoid copying every keyword
+     * string.
+     */
+    jdbc2_fdw_options = (JdbcFdwOption *)
+        malloc(sizeof(JdbcFdwOption) * num_libpq_opts +
+               sizeof(non_libpq_options));
+    if (jdbc2_fdw_options == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+                 errmsg("out of memory")));
 
-	popt = jdbc2_fdw_options;
-	for (lopt = libpq_options; lopt->keyword; lopt++)
-	{
-		/* Hide debug options, as well as settings we override internally. */
-		if (strchr(lopt->dispchar, 'D') ||
-			strcmp(lopt->keyword, "fallback_application_name") == 0 ||
-			strcmp(lopt->keyword, "client_encoding") == 0)
-			continue;
+    popt = jdbc2_fdw_options;
+    for (lopt = libpq_options; lopt->keyword; lopt++)
+    {
+        /* Hide debug options, as well as settings we override internally. */
+        if (strchr(lopt->dispchar, 'D') ||
+            strcmp(lopt->keyword, "fallback_application_name") == 0 ||
+            strcmp(lopt->keyword, "client_encoding") == 0)
+            continue;
 
-		/* We don't have to copy keyword string, as described above. */
-		popt->keyword = lopt->keyword;
+        /* We don't have to copy keyword string, as described above. */
+        popt->keyword = lopt->keyword;
 
-		/*
-		 * "user" and any secret options are allowed only on user mappings.
-		 * Everything else is a server option.
-		 */
-		if (strcmp(lopt->keyword, "user") == 0 || strchr(lopt->dispchar, '*'))
-			popt->optcontext = UserMappingRelationId;
-		else
-			popt->optcontext = ForeignServerRelationId;
-		popt->is_libpq_opt = true;
+        /*
+         * "user" and any secret options are allowed only on user mappings.
+         * Everything else is a server option.
+         */
+        if (strcmp(lopt->keyword, "user") == 0 || strchr(lopt->dispchar, '*'))
+            popt->optcontext = UserMappingRelationId;
+        else
+            popt->optcontext = ForeignServerRelationId;
+        popt->is_libpq_opt = true;
 
-		popt++;
-	}
+        popt++;
+    }
 
-	/* Append FDW-specific options and dummy terminator. */
-	memcpy(popt, non_libpq_options, sizeof(non_libpq_options));
+    /* Append FDW-specific options and dummy terminator. */
+    memcpy(popt, non_libpq_options, sizeof(non_libpq_options));
 }
 
 /*
@@ -232,17 +239,17 @@ InitPgFdwOptions(void)
 static bool
 is_valid_option(const char *keyword, Oid context)
 {
-	PgFdwOption *opt;
+    JdbcFdwOption *opt;
 
-	Assert(jdbc2_fdw_options);		/* must be initialized already */
+    Assert(jdbc2_fdw_options);      /* must be initialized already */
 
-	for (opt = jdbc2_fdw_options; opt->keyword; opt++)
-	{
-		if (context == opt->optcontext && strcmp(opt->keyword, keyword) == 0)
-			return true;
-	}
+    for (opt = jdbc2_fdw_options; opt->keyword; opt++)
+    {
+        if (context == opt->optcontext && strcmp(opt->keyword, keyword) == 0)
+            return true;
+    }
 
-	return false;
+    return false;
 }
 
 /*
@@ -251,17 +258,17 @@ is_valid_option(const char *keyword, Oid context)
 static bool
 is_libpq_option(const char *keyword)
 {
-	PgFdwOption *opt;
+    JdbcFdwOption *opt;
 
-	Assert(jdbc2_fdw_options);		/* must be initialized already */
+    Assert(jdbc2_fdw_options);      /* must be initialized already */
 
-	for (opt = jdbc2_fdw_options; opt->keyword; opt++)
-	{
-		if (opt->is_libpq_opt && strcmp(opt->keyword, keyword) == 0)
-			return true;
-	}
+    for (opt = jdbc2_fdw_options; opt->keyword; opt++)
+    {
+        if (opt->is_libpq_opt && strcmp(opt->keyword, keyword) == 0)
+            return true;
+    }
 
-	return false;
+    return false;
 }
 
 /*
@@ -271,25 +278,25 @@ is_libpq_option(const char *keyword)
  */
 int
 ExtractConnectionOptions(List *defelems, const char **keywords,
-						 const char **values)
+                         const char **values)
 {
-	ListCell   *lc;
-	int			i;
+    ListCell   *lc;
+    int         i;
 
-	/* Build our options lists if we didn't yet. */
-	InitPgFdwOptions();
+    /* Build our options lists if we didn't yet. */
+    InitJdbcFdwOptions();
 
-	i = 0;
-	foreach(lc, defelems)
-	{
-		DefElem    *d = (DefElem *) lfirst(lc);
+    i = 0;
+    foreach(lc, defelems)
+    {
+        DefElem    *d = (DefElem *) lfirst(lc);
 
-		if (is_libpq_option(d->defname))
-		{
-			keywords[i] = d->defname;
-			values[i] = defGetString(d);
-			i++;
-		}
-	}
-	return i;
+        if (is_libpq_option(d->defname))
+        {
+            keywords[i] = d->defname;
+            values[i] = defGetString(d);
+            i++;
+        }
+    }
+    return i;
 }

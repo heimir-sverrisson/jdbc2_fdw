@@ -13,14 +13,14 @@ REGRESS = jdbc2_fdw
 
 JDBC_CONFIG = jdbc_config
 
-SHLIB_LINK = -ljvm
+SHLIB_LINK += -ljvm
 
 UNAME = $(shell uname)
 
 # Special treatment for Mac OS X
 ifeq ($(UNAME), Darwin)
 #	SHLIB_LINK = -I/System/Library/Frameworks/JavaVM.framework/Headers -L/System/Library/Frameworks/JavaVM.framework/Libraries -ljvm -framework JavaVM
-	SHLIB_LINK = -I$(JAVA_HOME)/include -L$(JAVA_HOME)/jre/lib -ljvm -framework JavaVM
+	SHLIB_LINK += -I$(JAVA_HOME)/include -L$(JAVA_HOME)/jre/lib -framework JavaVM
 endif
 
 
@@ -30,14 +30,14 @@ JAVA_SOURCES = \
 	JDBCUtils.java \
 	JDBCDriverLoader.java \
  
-PG_CPPFLAGS=-D'PKG_LIB_DIR=$(pkglibdir)'
+PG_CPPFLAGS=-D'PKG_LIB_DIR=$(pkglibdir)' -I$(libpq_srcdir)
 
 JFLAGS = -d $(pkglibdir)
 
 # all:$(TRGTS)
 
-JAVAFILES:
-	javac $(JFLAGS) $(JAVA_SOURCES)
+#JAVAFILES:
+#	javac $(JFLAGS) $(JAVA_SOURCES)
 
 # the db name is hard-coded in the tests
 override USE_MODULE_DB =
