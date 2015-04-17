@@ -1,15 +1,16 @@
 /*-------------------------------------------------------------------------
  *
- *		  foreign-data wrapper for JDBC
+ *                foreign-data wrapper for JDBC
  *
  * Copyright (c) 2012, PostgreSQL Global Development Group
  *
  * This software is released under the PostgreSQL Licence
  *
  * Author: Atri Sharma <atri.jiit@gmail.com>
+ * Changes by: Heimir Sverrisson <heimir.sverrisson@gmail.com>, 2015-04-17
  *
  * IDENTIFICATION
- *		  jdbc_fdw/JDBCUtils.java
+ *                jdbc2_fdw/JDBCUtils.java
  *
  *-------------------------------------------------------------------------
  */
@@ -23,206 +24,205 @@ import java.net.MalformedURLException;
 import java.util.*;
 public class JDBCUtils
 {
-	private ResultSet 		result_set;
-	private Connection 		conn;
-	private int 			NumberOfColumns;
-	private int 			NumberOfRows;
-	private Statement 		sql;
-	private String[] 		Iterate;
-	private static JDBCDriverLoader JDBC_Driver_Loader;
-	private StringWriter 		exception_stack_trace_string_writer;
-	private PrintWriter 		exception_stack_trace_print_writer;
+    private ResultSet               resultSet;
+    private Connection              conn = null;
+    private int                     numberOfColumns;
+    private int                     numberOfRows;
+    private Statement               stmt = null;
+    private String[]                resultRow;
+    private static JDBCDriverLoader jdbcDriverLoader;
+    private StringWriter            exceptionStringWriter;
+    private PrintWriter             exceptionPrintWriter;
+    private int                     queryTimeoutValue;
+    private ResultSetMetaData       rSetMetadata;
 
-/*
- * Initialize
- *		Initiates the connection to the foreign database after setting 
- *		up initial configuration and executes the query.
- */
-	public String
-	Initialize(String[] options_array) throws IOException
-	{       
-		DatabaseMetaData 	db_metadata;
-		ResultSetMetaData 	result_set_metadata;
-		Properties 		JDBCProperties;
-		Class 			JDBCDriverClass = null;
-		Driver 			JDBCDriver = null;
-		String 			query = options_array[0];
-		String 			DriverClassName = options_array[1];
-		String 			url = options_array[2];
-  		String 			userName = options_array[3];
-  		String 			password = options_array[4];
-		int 			querytimeoutvalue = Integer.parseInt(options_array[5]);
+    /*
+     * createConnection
+     *      Initiates the connection to the foreign database after setting 
+     *      up initial configuration.
+     *      Caller will pass in a six element array with the following elements:
+     *          0 - Driver class name, 1 - JDBC URL, 2 - Username
+     *          3 - Password, 4 - Query timeout in seconds, 5 - jarfile
+     *      Returns:
+     *          null on success
+     *          otherwise a string containing a stack trace
+     */
+    public String
+    createConnection(String[] options) throws IOException
+    {       
+        DatabaseMetaData        dbMetadata;
+        Properties              jdbcProperties;
+        Class                   jdbcDriverClass = null;
+        Driver                  jdbcDriver = null;
+        String                  driverClassName = options[0];
+        String                  url = options[1];
+        String                  userName = options[2];
+        String                  password = options[3];
+        String                  qTimeoutValue = options[4];
+        String                  fileName = options[5];
 
-		exception_stack_trace_string_writer = new StringWriter();
- 		exception_stack_trace_print_writer = new PrintWriter(exception_stack_trace_string_writer);
+        queryTimeoutValue = Integer.parseInt(qTimeoutValue);
+        exceptionStringWriter = new StringWriter();
+        exceptionPrintWriter = new PrintWriter(exceptionStringWriter);
+        numberOfColumns = 0;
+        try {
+            File JarFile = new File(fileName);
+            String jarfile_path = JarFile.toURI().toURL().toString();
+            if (jdbcDriverLoader == null) {
+                /* If jdbcDriverLoader is being created. */
+                jdbcDriverLoader = new JDBCDriverLoader(new URL[]{JarFile.toURI().toURL()}); 
+            } else if (jdbcDriverLoader.CheckIfClassIsLoaded(driverClassName) == null) {
+                jdbcDriverLoader.addPath(jarfile_path);
+            }       
+            jdbcDriverClass = jdbcDriverLoader.loadClass(driverClassName);
+            jdbcDriver = (Driver)jdbcDriverClass.newInstance();
+            jdbcProperties = new Properties();
+            jdbcProperties.put("user", userName);
+            jdbcProperties.put("password", password);
+            conn = jdbcDriver.connect(url, jdbcProperties);
+            dbMetadata = conn.getMetaData();
+        } catch (Exception e) {
+            /* If an exception occurs,it is returned back to the
+             * calling C code by returning a Java String object
+             * that has the exception's stack trace.
+             * If all goes well,a null String is returned. */
+            e.printStackTrace(exceptionPrintWriter);
+            return (new String(exceptionStringWriter.toString()));
+        }
+        return null;
+    }
 
-  		NumberOfColumns = 0;
-  		conn = null;
+    /*
+     * createStatement
+     *      Create a statement object based on the query
+     *      Returns:
+     *          null on success
+     *          otherwise a string containing a stack trace
+     */
+    public String
+    createStatement(String query) throws IOException
+    {
+        try {
+            if(conn == null){
+                throw new Exception("Must create connection before creating a statment");
+            }
+            if(stmt != null){
+                throw new Exception("Must close a prior statement before creating a new one");
+            }
+            stmt = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+            if (queryTimeoutValue != 0) {
+                stmt.setQueryTimeout(queryTimeoutValue);
+            }
+            resultSet = stmt.executeQuery(query);
+            rSetMetadata = resultSet.getMetaData();
+            numberOfColumns = rSetMetadata.getColumnCount();
+            resultRow = new String[numberOfColumns];
+        } catch (Exception e) {
+            /* If an exception occurs,it is returned back to the
+             * calling C code by returning a Java String object
+             * that has the exception's stack trace.
+             * If all goes well,a null String is returned. */
+            e.printStackTrace(exceptionPrintWriter);
+            return (new String(exceptionStringWriter.toString()));
+        }
+        return null;
+    }
 
-  		try 
-		{
-			File 	JarFile = new File(options_array[6]);
-			String 	jarfile_path = JarFile.toURI().toURL().toString();
+    /*
+     * returnResultSet
+     *      Returns the result set that is returned from the foreign database
+     *      after execution of the query to C code. One row is returned at a time
+     *      as a String array. After last row null is returned.
+     */
+    public String[] 
+    returnResultSet()
+    {
+        int i = 0;
+        try {
+            /* Row-by-row processing is done in jdbc_fdw.One row
+             * at a time is returned to the C code. */
+            if (resultSet.next()) {
+                for (i = 0; i < numberOfColumns; i++) {
+                    resultRow[i] = resultSet.getString(i+1); // Convert all columns to String
+                }
+                ++numberOfRows;                         
+                /* The current row in resultSet is returned
+                 * to the C code in a Java String array that
+                 * has the value of the fields of the current
+                 * row as it values. */
+                return (resultRow);
+            }
+        } catch (Exception e) {
+            e.printStackTrace(); // Best we can do, cannot return exception to caller!
+        }
+        /* All of resultSet's rows have been returned to the C code. */
+        return null;
+    }
 
-			if (JDBC_Driver_Loader == null)
-			{
-				/* If JDBC_Driver_Loader is being 									
-				 * created. */
-				JDBC_Driver_Loader = new JDBCDriverLoader(new URL[]{JarFile.toURI().toURL()}); 
-			}
-			else if (JDBC_Driver_Loader.CheckIfClassIsLoaded(DriverClassName) == null)
-			{
-				JDBC_Driver_Loader.addPath(jarfile_path);
-			}	
+    /*
+     * closeStatement
+     *      Releases the resources used by statement. Keeps the connection
+     *      open for another statement to be executed.             
+     */
+    public String 
+    closeStatement()
+    {
+        try {
+            if(resultSet != null){
+                resultSet.close();
+                resultSet = null;
+            }
+            if(stmt != null){
+                stmt.close();
+                stmt = null;
+            }
+            resultRow = null;
+        } catch (Exception e) {
+            /* If an exception occurs,it is returned back to the
+             * calling C code by returning a Java String object
+             * that has the exception's stack trace.
+             * If all goes well,a null String is returned. */
+            e.printStackTrace(exceptionPrintWriter);
+            return (new String(exceptionStringWriter.toString()));
+        }
+        return null;
+    }
 
-			JDBCDriverClass = JDBC_Driver_Loader.loadClass(DriverClassName);
+    /*
+     * closeConnection
+     *     Releases the resources used by connection.
+     */
+    public String 
+    closeConnection()
+    {
+        closeStatement(); // For good measure
+        try {
+            if(conn != null){
+                conn.close();
+                conn = null;
+            }
+        } catch (Exception e) {
+            /* If an exception occurs,it is returned back to the
+             * calling C code by returning a Java String object
+             * that has the exception's stack trace.
+             * If all goes well,a null String is returned. */
+            e.printStackTrace(exceptionPrintWriter);
+            return (new String(exceptionStringWriter.toString()));
+        }
+        return null;
+    }
 
-			JDBCDriver = (Driver)JDBCDriverClass.newInstance();
-			JDBCProperties = new Properties();
-
-			JDBCProperties.put("user", userName);
-			JDBCProperties.put("password", password);
-
-			conn = JDBCDriver.connect(url, JDBCProperties);
-  		
-  			db_metadata = conn.getMetaData();
-
-  			sql = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
-			try
-			{
-				if (querytimeoutvalue != 0)
-				{
-					sql.setQueryTimeout(querytimeoutvalue);
-				}
-
-			}
-			catch(Exception setquerytimeout_exception)
-			{
-				/* If an exception occurs,it is returned back to the
-			 	 * calling C code by returning a Java String object
-			 	 * that has the exception's stack trace.
-			 	 * If all goes well,a null String is returned. */
-
-		 		setquerytimeout_exception.printStackTrace(exception_stack_trace_print_writer);
-				return (new String(exception_stack_trace_string_writer.toString()));
-			}
-
-  			result_set = sql.executeQuery(query);
-
-  			result_set_metadata = result_set.getMetaData();
-  			NumberOfColumns = result_set_metadata.getColumnCount();
-  			Iterate = new String[NumberOfColumns];
-		}
-		catch (Exception initialize_exception)
-	  	{
-			/* If an exception occurs,it is returned back to the
-			 * calling C code by returning a Java String object
-			 * that has the exception's stack trace.
-			 * If all goes well,a null String is returned. */
-
-  	  		initialize_exception.printStackTrace(exception_stack_trace_print_writer);
-			return (new String(exception_stack_trace_string_writer.toString()));
-	  	}
-
-		return null;
-	}
-
-/*
- * ReturnResultSet
- *		Returns the result set that is returned from the foreign database
- *		after execution of the query to C code.
- */
-	public String[] 
-	ReturnResultSet()
-	{
-		int 	i = 0;
-
-		try
-		{
-			/* Row-by-row processing is done in jdbc_fdw.One row
-			 * at a time is returned to the C code. */
-			if (result_set.next())
-			{
-				for (i = 0; i < NumberOfColumns; i++)
-				{
-    					Iterate[i] = result_set.getString(i+1);
-				}
-
-				++NumberOfRows;				
-				
-				/* The current row in result_set is returned
-				 * to the C code in a Java String array that
-				 * has the value of the fields of the current
-				 * row as it values. */
-
-				return (Iterate);
-			}
-
-		}
-		catch (Exception returnresultset_exception)
-	 	{
-			returnresultset_exception.printStackTrace();
-	 	}
-
-		/* All of result_set's rows have been returned to the C code. */
-		return null;
-	}
-
-/*
- * Close
- *		Releases the resources used.
- */
-	public String 
-	Close()
-	{
-
-		try
-		{
-			result_set.close();
-			conn.close();
-			result_set = null;
-			conn = null;
-			Iterate = null;
-		}
-		catch (Exception close_exception) 
-	 	{
-			/* If an exception occurs,it is returned back to the
-			 * calling C code by returning a Java String object
-			 * that has the exception's stack trace.
-			 * If all goes well,a null String is returned. */
-
-	 		close_exception.printStackTrace(exception_stack_trace_print_writer);
-			return (new String(exception_stack_trace_string_writer.toString()));
-	 	}
-
-		return null;
-	}
-
-/*
- * Cancel
- *		Cancels the query and releases the resources in case query
- *		cancellation is requested by the user.
- */
-	public String 
-	Cancel()
-	{
-
-		try
-		{
-			result_set.close();
-			conn.close();
-		}
-		catch(Exception cancel_exception)
-	 	{
-			/* If an exception occurs,it is returned back to the
-			 * calling C code by returning a Java String object
-			 * that has the exception's stack trace.
-			 * If all goes well,a null String is returned. */
-
-			cancel_exception.printStackTrace(exception_stack_trace_print_writer);
-			return (new String(exception_stack_trace_string_writer.toString()));
-  	 	}
-
-		return null;
-	}
+    /*
+     * cancel
+     *      Cancels the query and releases the resources in case query
+     *      cancellation is requested by the user.
+     *      Returns:
+     *          null on success
+     *          otherwise a string containing a stack trace
+     */
+    public String 
+    cancel()
+    {
+        return closeStatement();
+    }
 }

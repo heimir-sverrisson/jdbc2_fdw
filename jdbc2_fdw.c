@@ -41,7 +41,6 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
-#include "jni.h"
 #define Str(arg) #arg
 #define StrValue(arg) Str(arg)
 #define STR_PKGLIBDIR StrValue(PKG_LIB_DIR)
@@ -145,7 +144,7 @@ typedef struct PgFdwScanState
     List       *retrieved_attrs;    /* list of retrieved attribute numbers */
 
     /* for remote query execution */
-    PGconn     *conn;           /* connection for the scan */
+    Jconn     *conn;           /* connection for the scan */
     unsigned int cursor_number; /* quasi-unique ID for my cursor */
     bool         cursor_exists; /* have we created the cursor? */
     int          numParams;     /* number of parameters passed to query */
@@ -176,7 +175,7 @@ typedef struct PgFdwModifyState
     AttInMetadata *attinmeta;   /* attribute datatype conversion metadata */
 
     /* for remote query execution */
-    PGconn     *conn;           /* connection for the scan */
+    Jconn     *conn;           /* connection for the scan */
     char       *p_name;         /* name of prepared statement, if created */
 
     /* extracted fdw_private data */
@@ -238,347 +237,6 @@ typedef struct
  * SQL functions
  */
 PG_FUNCTION_INFO_V1(jdbc2_fdw_handler);
-
-/*
- * Local housekeeping functions and Java objects
- */
-static JNIEnv *env;
-static JavaVM *jvm;
-jobject java_call;
-static bool InterruptFlag;   /* Used for checking for SIGINT interrupt */
-/*
- * Describes the valid options for objects that use this wrapper.
- */
-struct jdbcFdwOption
-{
-    const char  *optname;
-    Oid     optcontext; /* Oid of catalog in which option may appear */
-};
-
-/*
- * Valid options for jdbc_fdw.
- *
- */
-static struct jdbcFdwOption valid_options[] =
-{
-
-    /* Connection options */
-    { "drivername",     ForeignServerRelationId },
-    { "url",        ForeignServerRelationId },
-    { "querytimeout",   ForeignServerRelationId },
-    { "jarfile",        ForeignServerRelationId },
-    { "maxheapsize",    ForeignServerRelationId },
-    { "username",       UserMappingRelationId },
-    { "password",       UserMappingRelationId },
-    { "query",      ForeignTableRelationId },
-    { "table",      ForeignTableRelationId },
-
-    /* Sentinel */
-    { NULL,         InvalidOid }
-};
-
-/*
- * Helper functions
- */
-static bool jdbcIsValidOption(const char *option, Oid context);
-static void jdbcGetOptions(
-    Oid foreigntableid,
-    char **drivername,
-    char **url,
-    int *querytimeout,
-    char **jarfile,
-    int* maxheapsize,
-    char **username,
-    char **password,
-    char **query,
-    char **table
-);
-/*
- * Uses a String object's content to create an instance of C String
- */
-static char* ConvertStringToCString(jobject);
-/*
- * JVM Initialization function
- */
-static void JVMInitialization(Oid);
-/*
- * JVM destroy function
- */
-static void DestroyJVM();
-/*
- * SIGINT interrupt check and process function
- */
-static void SIGINTInterruptCheckProcess();
-
-/*
- * SIGINTInterruptCheckProcess
- *      Checks and processes if SIGINT interrupt occurs
- */
-static void
-SIGINTInterruptCheckProcess()
-{
-
-    if (InterruptFlag == true)
-    {   
-        jclass      JDBCUtilsClass;
-        jmethodID   id_cancel;  
-        jstring     cancel_result = NULL;
-        char        *cancel_result_cstring = NULL;
-
-        JDBCUtilsClass = (*env)->FindClass(env, "JDBCUtils");
-        if (JDBCUtilsClass == NULL) 
-        {       
-            elog(ERROR, "JDBCUtilsClass is NULL");
-        }       
-
-        id_cancel = (*env)->GetMethodID(env, JDBCUtilsClass, "Cancel", "()Ljava/lang/String;");
-        if (id_cancel == NULL) 
-        {       
-            elog(ERROR, "id_cancel is NULL");
-        }       
-
-        cancel_result = (*env)->CallObjectMethod(env,java_call,id_cancel);
-        if (cancel_result != NULL)
-        {       
-            cancel_result_cstring = ConvertStringToCString((jobject)cancel_result);
-            elog(ERROR, "%s", cancel_result_cstring);
-        }       
-
-        InterruptFlag = false;
-        elog(ERROR, "Query has been cancelled");
-
-        (*env)->ReleaseStringUTFChars(env, cancel_result, cancel_result_cstring);
-        (*env)->DeleteLocalRef(env, cancel_result);
-    }   
-}
-
-/*
- * ConvertStringToCString
- *              Uses a String object passed as a jobject to the function to 
- *              create an instance of C String.
- */
-static char*
-ConvertStringToCString(jobject java_cstring)
-{
-        jclass  JavaString;
-        char    *StringPointer;
-
-        SIGINTInterruptCheckProcess();
-
-        JavaString = (*env)->FindClass(env, "java/lang/String");
-        if (!((*env)->IsInstanceOf(env, java_cstring, JavaString)))
-        {
-                elog(ERROR, "Object not an instance of String class");
-        }
-
-        if (java_cstring != NULL)
-        {
-                StringPointer = (char*)(*env)->GetStringUTFChars(env, (jstring)java_cstring, 0);
-        }
-        else
-        {
-                StringPointer = NULL;
-        }
-
-        return (StringPointer);
-}
-
-/*
- * DestroyJVM
- *      Shuts down the JVM.
- */
-static void
-DestroyJVM()
-{
-
-    (*jvm)->DestroyJavaVM(jvm);
-}
-
-/*
- * JVMInitialization
- *      Create the JVM which will be used for calling the Java routines
- *          that use JDBC to connect and access the foreign database.
- *
- */
-static void
-JVMInitialization(Oid foreigntableid)
-{
-    jint res = -5;/* Initializing the value of res so that we can check it later to see whether JVM has been correctly created or not*/
-    JavaVMInitArgs  vm_args;
-    JavaVMOption    *options;
-    static bool     FunctionCallCheck = false;   /* This flag safeguards against multiple calls of JVMInitialization().*/
-    char        strpkglibdir[] = STR_PKGLIBDIR;
-    char        *classpath;
-    char        *svr_drivername = NULL;
-    char        *svr_url = NULL;
-    char        *svr_username = NULL;
-    char        *svr_password = NULL;
-    char        *svr_query = NULL;
-    char        *svr_table = NULL;
-    char        *svr_jarfile = NULL;
-    char        *maxheapsizeoption = NULL;
-    int         svr_querytimeout = 0;
-    int         svr_maxheapsize = 0;
-
-    jdbcGetOptions(
-        foreigntableid,
-        &svr_drivername,
-        &svr_url,
-        &svr_querytimeout,
-        &svr_jarfile,
-        &svr_maxheapsize,
-        &svr_username,
-        &svr_password,
-        &svr_query,
-        &svr_table
-    );
-
-    SIGINTInterruptCheckProcess();
-
-
-    if (FunctionCallCheck == false)
-    {
-        classpath = (char*)palloc(strlen(strpkglibdir) + 19);
-        snprintf(classpath, strlen(strpkglibdir) + 19, "-Djava.class.path=%s", strpkglibdir);
-
-        if (svr_maxheapsize != 0)   /* If the user has given a value for setting the max heap size of the JVM */
-        {
-            options = (JavaVMOption*)palloc(sizeof(JavaVMOption)*2);
-            maxheapsizeoption = (char*)palloc(sizeof(int) + 6);
-            snprintf(maxheapsizeoption, sizeof(int) + 6, "-Xmx%dm", svr_maxheapsize);
-
-            options[0].optionString = classpath;
-            options[1].optionString = maxheapsizeoption;
-            vm_args.nOptions = 2;
-        }
-        else
-        {
-            options = (JavaVMOption*)palloc(sizeof(JavaVMOption));
-            options[0].optionString = classpath;
-            vm_args.nOptions = 1;
-        }
-
-        vm_args.version = 0x00010002;
-        vm_args.options = options;
-        vm_args.ignoreUnrecognized = JNI_FALSE;
-
-        /* Create the Java VM */
-        res = JNI_CreateJavaVM(&jvm, (void**)&env, &vm_args);
-        if (res < 0)
-        {
-            ereport(ERROR,
-                 (errmsg("Failed to create Java VM")
-                 ));
-        }
-
-        InterruptFlag = false;
-        /* Register an on_proc_exit handler that shuts down the JVM.*/
-        on_proc_exit(DestroyJVM, 0);
-        FunctionCallCheck = true;
-    }
-}
-/*
- * SIGINTInterruptHandler
- *      Handles SIGINT interrupt
- */
-static void
-SIGINTInterruptHandler(int sig)
-{
-
-    InterruptFlag = true;
-}
-/*
- * Check if the provided option is one of the valid options.
- * context is the Oid of the catalog holding the object the option is for.
- */
-static bool
-jdbcIsValidOption(const char *option, Oid context)
-{
-    struct jdbcFdwOption    *opt;
-
-    for (opt = valid_options; opt->optname; opt++)
-    {
-        if (context == opt->optcontext && strcmp(opt->optname, option) == 0)
-            return true;
-    }
-    return false;
-}
-
-/*
- * Fetch the options for a jdbc_fdw foreign table.
- */
-static void
-jdbcGetOptions(Oid foreigntableid, char **drivername, char **url, int *querytimeout, char **jarfile, int *maxheapsize, char **username, char **password, char **query, char **table)
-{
-    ForeignTable    *f_table;
-    ForeignServer   *f_server;
-    UserMapping *f_mapping;
-    List        *options;
-    ListCell    *lc;
-
-    /*
-     * Extract options from FDW objects.
-     */
-    f_table = GetForeignTable(foreigntableid);
-    f_server = GetForeignServer(f_table->serverid);
-    f_mapping = GetUserMapping(GetUserId(), f_table->serverid);
-
-    options = NIL;
-    options = list_concat(options, f_table->options);
-    options = list_concat(options, f_server->options);
-    options = list_concat(options, f_mapping->options);
-
-    /* Loop through the options, and get the server/port */
-    foreach(lc, options)
-    {
-        DefElem *def = (DefElem *) lfirst(lc);
-
-        if (strcmp(def->defname, "drivername") == 0)
-        {
-            *drivername = defGetString(def);
-        }
-
-        if (strcmp(def->defname, "username") == 0)
-        {
-            *username = defGetString(def);
-        }
-
-        if (strcmp(def->defname, "querytimeout") == 0)
-        {
-            *querytimeout = atoi(defGetString(def));
-        }
-        if (strcmp(def->defname, "jarfile") == 0)
-        {
-            *jarfile = defGetString(def);
-        }
-
-        if (strcmp(def->defname, "maxheapsize") == 0)
-        {
-            *maxheapsize = atoi(defGetString(def));
-        }
-
-        if (strcmp(def->defname, "password") == 0)
-        {
-            *password = defGetString(def);
-        }
-
-        if (strcmp(def->defname, "query") == 0)
-        {
-            *query = defGetString(def);
-        }
-
-        if (strcmp(def->defname, "table") == 0)
-        {
-            *table = defGetString(def);
-        }
-
-        if (strcmp(def->defname, "url") == 0)
-        {
-            *url = defGetString(def);
-        }
-    }
-}
-
 
 /*
  * FDW callback routines
@@ -646,7 +304,7 @@ static void estimate_path_cost_size(PlannerInfo *root,
                         double *p_rows, int *p_width,
                         Cost *p_startup_cost, Cost *p_total_cost);
 static void get_remote_estimate(const char *sql,
-                    PGconn *conn,
+                    Jconn *conn,
                     double *rows,
                     int *width,
                     Cost *startup_cost,
@@ -656,20 +314,20 @@ static bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
                           void *arg);
 static void create_cursor(ForeignScanState *node);
 static void fetch_more_data(ForeignScanState *node);
-static void close_cursor(PGconn *conn, unsigned int cursor_number);
+static void close_cursor(Jconn *conn, unsigned int cursor_number);
 static void prepare_foreign_modify(PgFdwModifyState *fmstate);
 static const char **convert_prep_stmt_params(PgFdwModifyState *fmstate,
                          ItemPointer tupleid,
                          TupleTableSlot *slot);
 static void store_returning_result(PgFdwModifyState *fmstate,
-                       TupleTableSlot *slot, PGresult *res);
+                       TupleTableSlot *slot, Jresult *res);
 static int postgresAcquireSampleRowsFunc(Relation relation, int elevel,
                               HeapTuple *rows, int targrows,
                               double *totalrows,
                               double *totaldeadrows);
-static void analyze_row_processor(PGresult *res, int row,
+static void analyze_row_processor(Jresult *res, int row,
                       PgFdwAnalyzeState *astate);
-static HeapTuple make_tuple_from_result_row(PGresult *res,
+static HeapTuple make_tuple_from_result_row(Jresult *res,
                            int row,
                            Relation rel,
                            AttInMetadata *attinmeta,
@@ -888,8 +546,6 @@ jdbcGetForeignPaths(PlannerInfo *root,
 {
     PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) baserel->fdw_private;
     ForeignPath *path;
-    List       *ppi_list;
-    ListCell   *lc;
 
     /*
      * Create simplest ForeignScan path node and add it to baserel.  This path
@@ -935,7 +591,7 @@ jdbcGetForeignPlan(PlannerInfo *root,
     StringInfoData sql;
     ListCell   *lc;
 
-    JVMInitialization(foreigntableid);
+//    JVMInitialization(foreigntableid);
     /*
      * Separate the scan_clauses into those that can be executed remotely and
      * those that can't.  baserestrictinfo clauses that were previously
@@ -1109,11 +765,11 @@ jdbcBeginForeignScan(ForeignScanState *node, int eflags)
      * Get connection to the foreign server.  Connection manager will
      * establish new connection if necessary.
      */
-//    fsstate->conn = GetConnection(server, user, false);
+    fsstate->conn = GetConnection(server, user, false);
 
     /* Assign a unique ID for my cursor */
-//    fsstate->cursor_number = GetCursorNumber(fsstate->conn);
-//    fsstate->cursor_exists = false;
+    fsstate->cursor_number = GetCursorNumber(fsstate->conn);
+    fsstate->cursor_exists = false;
 
     /* Get private info created by planner functions. */
     fsstate->query = strVal(list_nth(fsplan->fdw_private,
@@ -1226,7 +882,7 @@ postgresReScanForeignScan(ForeignScanState *node)
 {
     PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
     char        sql[64];
-    PGresult   *res;
+    Jresult   *res;
 
     /* If we haven't created the cursor yet, nothing to do. */
     if (!fsstate->cursor_exists)
@@ -1258,12 +914,12 @@ postgresReScanForeignScan(ForeignScanState *node)
 
     /*
      * We don't use a PG_TRY block here, so be careful not to throw error
-     * without releasing the PGresult.
+     * without releasing the Jresult.
      */
-    res = PQexec(fsstate->conn, sql);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK)
+    res = JQexec(fsstate->conn, sql);
+    if (JQresultStatus(res) != PGRES_COMMAND_OK)
         pgfdw_report_error(ERROR, res, fsstate->conn, true, sql);
-    PQclear(res);
+    JQclear(res);
 
     /* Now force a fresh FETCH. */
     fsstate->tuples = NULL;
@@ -1571,7 +1227,7 @@ postgresExecForeignInsert(EState *estate,
 {
     PgFdwModifyState *fmstate = (PgFdwModifyState *) resultRelInfo->ri_FdwState;
     const char **p_values;
-    PGresult   *res;
+    Jresult   *res;
     int         n_rows;
 
     /* Set up the prepared statement on the remote server, if we didn't yet */
@@ -1585,31 +1241,31 @@ postgresExecForeignInsert(EState *estate,
      * Execute the prepared statement, and check for success.
      *
      * We don't use a PG_TRY block here, so be careful not to throw error
-     * without releasing the PGresult.
+     * without releasing the Jresult.
      */
-    res = PQexecPrepared(fmstate->conn,
+    res = JQexecPrepared(fmstate->conn,
                          fmstate->p_name,
                          fmstate->p_nums,
                          p_values,
                          NULL,
                          NULL,
                          0);
-    if (PQresultStatus(res) !=
+    if (JQresultStatus(res) !=
         (fmstate->has_returning ? PGRES_TUPLES_OK : PGRES_COMMAND_OK))
         pgfdw_report_error(ERROR, res, fmstate->conn, true, fmstate->query);
 
     /* Check number of rows affected, and fetch RETURNING tuple if any */
     if (fmstate->has_returning)
     {
-        n_rows = PQntuples(res);
+        n_rows = JQntuples(res);
         if (n_rows > 0)
             store_returning_result(fmstate, slot, res);
     }
     else
-        n_rows = atoi(PQcmdTuples(res));
+        n_rows = atoi(JQcmdTuples(res));
 
     /* And clean up */
-    PQclear(res);
+    JQclear(res);
 
     MemoryContextReset(fmstate->temp_cxt);
 
@@ -1631,7 +1287,7 @@ postgresExecForeignUpdate(EState *estate,
     Datum       datum;
     bool        isNull;
     const char **p_values;
-    PGresult   *res;
+    Jresult   *res;
     int         n_rows;
 
     /* Set up the prepared statement on the remote server, if we didn't yet */
@@ -1655,31 +1311,31 @@ postgresExecForeignUpdate(EState *estate,
      * Execute the prepared statement, and check for success.
      *
      * We don't use a PG_TRY block here, so be careful not to throw error
-     * without releasing the PGresult.
+     * without releasing the Jresult.
      */
-    res = PQexecPrepared(fmstate->conn,
+    res = JQexecPrepared(fmstate->conn,
                          fmstate->p_name,
                          fmstate->p_nums,
                          p_values,
                          NULL,
                          NULL,
                          0);
-    if (PQresultStatus(res) !=
+    if (JQresultStatus(res) !=
         (fmstate->has_returning ? PGRES_TUPLES_OK : PGRES_COMMAND_OK))
         pgfdw_report_error(ERROR, res, fmstate->conn, true, fmstate->query);
 
     /* Check number of rows affected, and fetch RETURNING tuple if any */
     if (fmstate->has_returning)
     {
-        n_rows = PQntuples(res);
+        n_rows = JQntuples(res);
         if (n_rows > 0)
             store_returning_result(fmstate, slot, res);
     }
     else
-        n_rows = atoi(PQcmdTuples(res));
+        n_rows = atoi(JQcmdTuples(res));
 
     /* And clean up */
-    PQclear(res);
+    JQclear(res);
 
     MemoryContextReset(fmstate->temp_cxt);
 
@@ -1701,7 +1357,7 @@ postgresExecForeignDelete(EState *estate,
     Datum       datum;
     bool        isNull;
     const char **p_values;
-    PGresult   *res;
+    Jresult   *res;
     int         n_rows;
 
     /* Set up the prepared statement on the remote server, if we didn't yet */
@@ -1725,31 +1381,31 @@ postgresExecForeignDelete(EState *estate,
      * Execute the prepared statement, and check for success.
      *
      * We don't use a PG_TRY block here, so be careful not to throw error
-     * without releasing the PGresult.
+     * without releasing the Jresult.
      */
-    res = PQexecPrepared(fmstate->conn,
+    res = JQexecPrepared(fmstate->conn,
                          fmstate->p_name,
                          fmstate->p_nums,
                          p_values,
                          NULL,
                          NULL,
                          0);
-    if (PQresultStatus(res) !=
+    if (JQresultStatus(res) !=
         (fmstate->has_returning ? PGRES_TUPLES_OK : PGRES_COMMAND_OK))
         pgfdw_report_error(ERROR, res, fmstate->conn, true, fmstate->query);
 
     /* Check number of rows affected, and fetch RETURNING tuple if any */
     if (fmstate->has_returning)
     {
-        n_rows = PQntuples(res);
+        n_rows = JQntuples(res);
         if (n_rows > 0)
             store_returning_result(fmstate, slot, res);
     }
     else
-        n_rows = atoi(PQcmdTuples(res));
+        n_rows = atoi(JQcmdTuples(res));
 
     /* And clean up */
-    PQclear(res);
+    JQclear(res);
 
     MemoryContextReset(fmstate->temp_cxt);
 
@@ -1775,18 +1431,18 @@ postgresEndForeignModify(EState *estate,
     if (fmstate->p_name)
     {
         char        sql[64];
-        PGresult   *res;
+        Jresult   *res;
 
         snprintf(sql, sizeof(sql), "DEALLOCATE %s", fmstate->p_name);
 
         /*
          * We don't use a PG_TRY block here, so be careful not to throw error
-         * without releasing the PGresult.
+         * without releasing the Jresult.
          */
-        res = PQexec(fmstate->conn, sql);
-        if (PQresultStatus(res) != PGRES_COMMAND_OK)
+        res = JQexec(fmstate->conn, sql);
+        if (JQresultStatus(res) != PGRES_COMMAND_OK)
             pgfdw_report_error(ERROR, res, fmstate->conn, true, sql);
-        PQclear(res);
+        JQclear(res);
         fmstate->p_name = NULL;
     }
 
@@ -1915,7 +1571,7 @@ estimate_path_cost_size(PlannerInfo *root,
         List       *local_join_conds;
         StringInfoData sql;
         List       *retrieved_attrs;
-        PGconn     *conn;
+        Jconn     *conn;
         Selectivity local_sel;
         QualCost    local_cost;
 
@@ -2025,13 +1681,13 @@ estimate_path_cost_size(PlannerInfo *root,
  * The given "sql" must be an EXPLAIN command.
  */
 static void
-get_remote_estimate(const char *sql, PGconn *conn,
+get_remote_estimate(const char *sql, Jconn *conn,
                     double *rows, int *width,
                     Cost *startup_cost, Cost *total_cost)
 {
-    PGresult   *volatile res = NULL;
+    Jresult   *volatile res = NULL;
 
-    /* PGresult must be released before leaving this function. */
+    /* Jresult must be released before leaving this function. */
     PG_TRY();
     {
         char       *line;
@@ -2041,8 +1697,8 @@ get_remote_estimate(const char *sql, PGconn *conn,
         /*
          * Execute EXPLAIN remotely.
          */
-        res = PQexec(conn, sql);
-        if (PQresultStatus(res) != PGRES_TUPLES_OK)
+        res = JQexec(conn, sql);
+        if (JQresultStatus(res) != PGRES_TUPLES_OK)
             pgfdw_report_error(ERROR, res, conn, false, sql);
 
         /*
@@ -2050,7 +1706,7 @@ get_remote_estimate(const char *sql, PGconn *conn,
          * left paren from the end of the line to avoid being confused by
          * other uses of parentheses.
          */
-        line = PQgetvalue(res, 0, 0);
+        line = JQgetvalue(res, 0, 0);
         p = strrchr(line, '(');
         if (p == NULL)
             elog(ERROR, "could not interpret EXPLAIN output: \"%s\"", line);
@@ -2059,13 +1715,13 @@ get_remote_estimate(const char *sql, PGconn *conn,
         if (n != 4)
             elog(ERROR, "could not interpret EXPLAIN output: \"%s\"", line);
 
-        PQclear(res);
+        JQclear(res);
         res = NULL;
     }
     PG_CATCH();
     {
         if (res)
-            PQclear(res);
+            JQclear(res);
         PG_RE_THROW();
     }
     PG_END_TRY();
@@ -2112,9 +1768,9 @@ create_cursor(ForeignScanState *node)
     ExprContext *econtext = node->ss.ps.ps_ExprContext;
     int         numParams = fsstate->numParams;
     const char **values = fsstate->param_values;
-    PGconn     *conn = fsstate->conn;
+    Jconn     *conn = fsstate->conn;
     StringInfoData buf;
-    PGresult   *res;
+    Jresult   *res;
 
     /*
      * Construct array of query parameter values in text format.  We do the
@@ -2172,13 +1828,13 @@ create_cursor(ForeignScanState *node)
      * server has the same OIDs we do for the parameters' types.
      *
      * We don't use a PG_TRY block here, so be careful not to throw error
-     * without releasing the PGresult.
+     * without releasing the Jresult.
      */
-    res = PQexecParams(conn, buf.data, numParams, NULL, values,
+    res = JQexecParams(conn, buf.data, numParams, NULL, values,
                        NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK)
+    if (JQresultStatus(res) != PGRES_COMMAND_OK)
         pgfdw_report_error(ERROR, res, conn, true, fsstate->query);
-    PQclear(res);
+    JQclear(res);
 
     /* Mark the cursor as created, and show no tuples have been retrieved */
     fsstate->cursor_exists = true;
@@ -2199,7 +1855,7 @@ static void
 fetch_more_data(ForeignScanState *node)
 {
     PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
-    PGresult   *volatile res = NULL;
+    Jresult   *volatile res = NULL;
     MemoryContext oldcontext;
 
     /*
@@ -2210,10 +1866,10 @@ fetch_more_data(ForeignScanState *node)
     MemoryContextReset(fsstate->batch_cxt);
     oldcontext = MemoryContextSwitchTo(fsstate->batch_cxt);
 
-    /* PGresult must be released before leaving this function. */
+    /* Jresult must be released before leaving this function. */
     PG_TRY();
     {
-        PGconn     *conn = fsstate->conn;
+        Jconn     *conn = fsstate->conn;
         char        sql[64];
         int         fetch_size;
         int         numrows;
@@ -2225,13 +1881,13 @@ fetch_more_data(ForeignScanState *node)
         snprintf(sql, sizeof(sql), "FETCH %d FROM c%u",
                  fetch_size, fsstate->cursor_number);
 
-        res = PQexec(conn, sql);
+        res = JQexec(conn, sql);
         /* On error, report the original query, not the FETCH. */
-        if (PQresultStatus(res) != PGRES_TUPLES_OK)
+        if (JQresultStatus(res) != PGRES_TUPLES_OK)
             pgfdw_report_error(ERROR, res, conn, false, fsstate->query);
 
         /* Convert the data into HeapTuples */
-        numrows = PQntuples(res);
+        numrows = JQntuples(res);
         fsstate->tuples = (HeapTuple *) palloc0(numrows * sizeof(HeapTuple));
         fsstate->num_tuples = numrows;
         fsstate->next_tuple = 0;
@@ -2253,13 +1909,13 @@ fetch_more_data(ForeignScanState *node)
         /* Must be EOF if we didn't get as many tuples as we asked for. */
         fsstate->eof_reached = (numrows < fetch_size);
 
-        PQclear(res);
+        JQclear(res);
         res = NULL;
     }
     PG_CATCH();
     {
         if (res)
-            PQclear(res);
+            JQclear(res);
         PG_RE_THROW();
     }
     PG_END_TRY();
@@ -2321,21 +1977,21 @@ reset_transmission_modes(int nestlevel)
  * Utility routine to close a cursor.
  */
 static void
-close_cursor(PGconn *conn, unsigned int cursor_number)
+close_cursor(Jconn *conn, unsigned int cursor_number)
 {
     char        sql[64];
-    PGresult   *res;
+    Jresult   *res;
 
     snprintf(sql, sizeof(sql), "CLOSE c%u", cursor_number);
 
     /*
      * We don't use a PG_TRY block here, so be careful not to throw error
-     * without releasing the PGresult.
+     * without releasing the Jresult.
      */
-    res = PQexec(conn, sql);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK)
+    res = JQexec(conn, sql);
+    if (JQresultStatus(res) != PGRES_COMMAND_OK)
         pgfdw_report_error(ERROR, res, conn, true, sql);
-    PQclear(res);
+    JQclear(res);
 }
 
 /*
@@ -2347,7 +2003,7 @@ prepare_foreign_modify(PgFdwModifyState *fmstate)
 {
     char        prep_name[NAMEDATALEN];
     char       *p_name;
-    PGresult   *res;
+    Jresult   *res;
 
     /* Construct name we'll use for the prepared statement. */
     snprintf(prep_name, sizeof(prep_name), "pgsql_fdw_prep_%u",
@@ -2362,17 +2018,17 @@ prepare_foreign_modify(PgFdwModifyState *fmstate)
      * the remote server will make the right choices.
      *
      * We don't use a PG_TRY block here, so be careful not to throw error
-     * without releasing the PGresult.
+     * without releasing the Jresult.
      */
-    res = PQprepare(fmstate->conn,
+    res = JQprepare(fmstate->conn,
                     p_name,
                     fmstate->query,
                     0,
                     NULL);
 
-    if (PQresultStatus(res) != PGRES_COMMAND_OK)
+    if (JQresultStatus(res) != PGRES_COMMAND_OK)
         pgfdw_report_error(ERROR, res, fmstate->conn, true, fmstate->query);
-    PQclear(res);
+    JQclear(res);
 
     /* This action shows that the prepare has been done. */
     fmstate->p_name = p_name;
@@ -2446,14 +2102,14 @@ convert_prep_stmt_params(PgFdwModifyState *fmstate,
  * store_returning_result
  *      Store the result of a RETURNING clause
  *
- * On error, be sure to release the PGresult on the way out.  Callers do not
+ * On error, be sure to release the Jresult on the way out.  Callers do not
  * have PG_TRY blocks to ensure this happens.
  */
 static void
 store_returning_result(PgFdwModifyState *fmstate,
-                       TupleTableSlot *slot, PGresult *res)
+                       TupleTableSlot *slot, Jresult *res)
 {
-    /* PGresult must be released before leaving this function. */
+    /* Jresult must be released before leaving this function. */
     PG_TRY();
     {
         HeapTuple   newtup;
@@ -2469,7 +2125,7 @@ store_returning_result(PgFdwModifyState *fmstate,
     PG_CATCH();
     {
         if (res)
-            PQclear(res);
+            JQclear(res);
         PG_RE_THROW();
     }
     PG_END_TRY();
@@ -2487,9 +2143,9 @@ postgresAnalyzeForeignTable(Relation relation,
     ForeignTable *table;
     ForeignServer *server;
     UserMapping *user;
-    PGconn     *conn;
+    Jconn     *conn;
     StringInfoData sql;
-    PGresult   *volatile res = NULL;
+    Jresult   *volatile res = NULL;
 
     /* Return the row-analysis function pointer */
     *func = postgresAcquireSampleRowsFunc;
@@ -2516,24 +2172,24 @@ postgresAnalyzeForeignTable(Relation relation,
     initStringInfo(&sql);
     deparseAnalyzeSizeSql(&sql, relation);
 
-    /* In what follows, do not risk leaking any PGresults. */
+    /* In what follows, do not risk leaking any Jresults. */
     PG_TRY();
     {
-        res = PQexec(conn, sql.data);
-        if (PQresultStatus(res) != PGRES_TUPLES_OK)
+        res = JQexec(conn, sql.data);
+        if (JQresultStatus(res) != PGRES_TUPLES_OK)
             pgfdw_report_error(ERROR, res, conn, false, sql.data);
 
-        if (PQntuples(res) != 1 || PQnfields(res) != 1)
+        if (JQntuples(res) != 1 || JQnfields(res) != 1)
             elog(ERROR, "unexpected result from deparseAnalyzeSizeSql query");
-        *totalpages = strtoul(PQgetvalue(res, 0, 0), NULL, 10);
+        *totalpages = strtoul(JQgetvalue(res, 0, 0), NULL, 10);
 
-        PQclear(res);
+        JQclear(res);
         res = NULL;
     }
     PG_CATCH();
     {
         if (res)
-            PQclear(res);
+            JQclear(res);
         PG_RE_THROW();
     }
     PG_END_TRY();
@@ -2569,10 +2225,10 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
     ForeignTable *table;
     ForeignServer *server;
     UserMapping *user;
-    PGconn     *conn;
+    Jconn     *conn;
     unsigned int cursor_number;
     StringInfoData sql;
-    PGresult   *volatile res = NULL;
+    Jresult   *volatile res = NULL;
 
     /* Initialize workspace state */
     astate.rel = relation;
@@ -2610,13 +2266,13 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
     appendStringInfo(&sql, "DECLARE c%u CURSOR FOR ", cursor_number);
     deparseAnalyzeSql(&sql, relation, &astate.retrieved_attrs);
 
-    /* In what follows, do not risk leaking any PGresults. */
+    /* In what follows, do not risk leaking any Jresults. */
     PG_TRY();
     {
-        res = PQexec(conn, sql.data);
-        if (PQresultStatus(res) != PGRES_COMMAND_OK)
+        res = JQexec(conn, sql.data);
+        if (JQresultStatus(res) != PGRES_COMMAND_OK)
             pgfdw_report_error(ERROR, res, conn, false, sql.data);
-        PQclear(res);
+        JQclear(res);
         res = NULL;
 
         /* Retrieve and process rows a batch at a time. */
@@ -2643,17 +2299,17 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
             snprintf(fetch_sql, sizeof(fetch_sql), "FETCH %d FROM c%u",
                      fetch_size, cursor_number);
 
-            res = PQexec(conn, fetch_sql);
+            res = JQexec(conn, fetch_sql);
             /* On error, report the original query, not the FETCH. */
-            if (PQresultStatus(res) != PGRES_TUPLES_OK)
+            if (JQresultStatus(res) != PGRES_TUPLES_OK)
                 pgfdw_report_error(ERROR, res, conn, false, sql.data);
 
             /* Process whatever we got. */
-            numrows = PQntuples(res);
+            numrows = JQntuples(res);
             for (i = 0; i < numrows; i++)
                 analyze_row_processor(res, i, &astate);
 
-            PQclear(res);
+            JQclear(res);
             res = NULL;
 
             /* Must be EOF if we didn't get all the rows requested. */
@@ -2667,7 +2323,7 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
     PG_CATCH();
     {
         if (res)
-            PQclear(res);
+            JQclear(res);
         PG_RE_THROW();
     }
     PG_END_TRY();
@@ -2697,7 +2353,7 @@ postgresAcquireSampleRowsFunc(Relation relation, int elevel,
  *   - Subsequently, replace already-sampled tuples randomly.
  */
 static void
-analyze_row_processor(PGresult *res, int row, PgFdwAnalyzeState *astate)
+analyze_row_processor(Jresult *res, int row, PgFdwAnalyzeState *astate)
 {
     int         targrows = astate->targrows;
     int         pos;            /* array index to store tuple in */
@@ -2761,15 +2417,15 @@ analyze_row_processor(PGresult *res, int row, PgFdwAnalyzeState *astate)
 }
 
 /*
- * Create a tuple from the specified row of the PGresult.
+ * Create a tuple from the specified row of the Jresult.
  *
  * rel is the local representation of the foreign table, attinmeta is
  * conversion data for the rel's tupdesc, and retrieved_attrs is an
- * integer list of the table column numbers present in the PGresult.
+ * integer list of the table column numbers present in the Jresult.
  * temp_context is a working context that can be reset after each tuple.
  */
 static HeapTuple
-make_tuple_from_result_row(PGresult *res,
+make_tuple_from_result_row(Jresult *res,
                            int row,
                            Relation rel,
                            AttInMetadata *attinmeta,
@@ -2787,7 +2443,7 @@ make_tuple_from_result_row(PGresult *res,
     ListCell   *lc;
     int         j;
 
-    Assert(row < PQntuples(res));
+    Assert(row < JQntuples(res));
 
     /*
      * Do the following work in a temp context that we reset after each tuple.
@@ -2812,7 +2468,7 @@ make_tuple_from_result_row(PGresult *res,
     error_context_stack = &errcallback;
 
     /*
-     * i indexes columns in the relation, j indexes columns in the PGresult.
+     * i indexes columns in the relation, j indexes columns in the Jresult.
      */
     j = 0;
     foreach(lc, retrieved_attrs)
@@ -2821,10 +2477,10 @@ make_tuple_from_result_row(PGresult *res,
         char       *valstr;
 
         /* fetch next column's textual value */
-        if (PQgetisnull(res, row, j))
+        if (JQgetisnull(res, row, j))
             valstr = NULL;
         else
-            valstr = PQgetvalue(res, row, j);
+            valstr = JQgetvalue(res, row, j);
 
         /* convert value to internal representation */
         if (i > 0)
@@ -2860,9 +2516,9 @@ make_tuple_from_result_row(PGresult *res,
 
     /*
      * Check we got the expected number of columns.  Note: j == 0 and
-     * PQnfields == 1 is expected, since deparse emits a NULL if no columns.
+     * JQnfields == 1 is expected, since deparse emits a NULL if no columns.
      */
-    if (j > 0 && j != PQnfields(res))
+    if (j > 0 && j != JQnfields(res))
         elog(ERROR, "remote query result does not match the foreign table");
 
     /*

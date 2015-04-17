@@ -44,7 +44,7 @@ typedef struct ConnCacheKey
 typedef struct ConnCacheEntry
 {
     ConnCacheKey key;           /* hash key (must be first) */
-    PGconn     *conn;           /* connection to foreign server, or NULL */
+    Jconn     *conn;            /* connection to foreign server, or NULL */
     int         xact_depth;     /* 0 = no xact open, 1 = main xact open, 2 =
                                  * one level of subxact open, etc */
     bool        have_prep_stmt; /* have we prepared any stmts in this xact? */
@@ -64,10 +64,10 @@ static unsigned int prep_stmt_number = 0;
 static bool xact_got_connection = false;
 
 /* prototypes of private functions */
-static PGconn *connect_pg_server(ForeignServer *server, UserMapping *user);
+static Jconn *connect_jdbc_server(ForeignServer *server, UserMapping *user);
 static void check_conn_params(const char **keywords, const char **values);
-static void configure_remote_session(PGconn *conn);
-static void do_sql_command(PGconn *conn, const char *sql);
+static void configure_remote_session(Jconn *conn);
+static void do_sql_command(Jconn *conn, const char *sql);
 static void begin_remote_xact(ConnCacheEntry *entry);
 static void pgfdw_xact_callback(XactEvent event, void *arg);
 static void pgfdw_subxact_callback(SubXactEvent event,
@@ -77,7 +77,7 @@ static void pgfdw_subxact_callback(SubXactEvent event,
 
 
 /*
- * Get a PGconn which can be used to execute queries on the remote PostgreSQL
+ * Get a Jconn which can be used to execute queries on the remote JDBC server
  * server with the user's authorization.  A new connection is established
  * if we don't already have a suitable one, and a transaction is opened at
  * the right subtransaction nesting depth if we didn't do that already.
@@ -93,7 +93,7 @@ static void pgfdw_subxact_callback(SubXactEvent event,
  * be useful and not mere pedantry.  We could not flush any active connections
  * mid-transaction anyway.
  */
-PGconn *
+Jconn *
 GetConnection(ForeignServer *server, UserMapping *user,
               bool will_prep_stmt)
 {
@@ -123,6 +123,7 @@ GetConnection(ForeignServer *server, UserMapping *user,
         RegisterXactCallback(pgfdw_xact_callback, NULL);
         RegisterSubXactCallback(pgfdw_subxact_callback, NULL);
     }
+ereport(DEBUG3, (errmsg("\"Added server = %s to hashtable\"\n",server->servername)));
 
     /* Set flag that we did GetConnection during the current transaction */
     xact_got_connection = true;
@@ -152,7 +153,7 @@ GetConnection(ForeignServer *server, UserMapping *user,
 
     /*
      * If cache entry doesn't have a connection, we have to establish a new
-     * connection.  (If connect_pg_server throws an error, the cache entry
+     * connection.  (If connect_jdbc_server throws an error, the cache entry
      * will be left in a valid empty state.)
      */
     if (entry->conn == NULL)
@@ -160,7 +161,7 @@ GetConnection(ForeignServer *server, UserMapping *user,
         entry->xact_depth = 0;  /* just to be sure */
         entry->have_prep_stmt = false;
         entry->have_error = false;
-        entry->conn = connect_pg_server(server, user);
+        entry->conn = connect_jdbc_server(server, user);
         elog(DEBUG3, "new jdbc2_fdw connection %p for server \"%s\"",
              entry->conn, server->servername);
     }
@@ -179,10 +180,10 @@ GetConnection(ForeignServer *server, UserMapping *user,
 /*
  * Connect to remote server using specified server and user mapping properties.
  */
-static PGconn *
-connect_pg_server(ForeignServer *server, UserMapping *user)
+static Jconn *
+connect_jdbc_server(ForeignServer *server, UserMapping *user)
 {
-    PGconn     *volatile conn = NULL;
+    Jconn     *volatile conn = NULL;
 
     /*
      * Use PG_TRY block to ensure closing connection on error.
@@ -193,6 +194,7 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
         const char **values;
         int         n;
 
+        ereport(DEBUG3, (errmsg("Entering connect_jdbc_server:")));
         /*
          * Construct connection params from generic options of ForeignServer
          * and UserMapping.  (Some of them might not be libpq options, in
@@ -224,14 +226,14 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
         /* verify connection parameters and make connection */
         check_conn_params(keywords, values);
 
-        conn = PQconnectdbParams(keywords, values, false);
-        if (!conn || PQstatus(conn) != CONNECTION_OK)
+        conn = JQconnectdbParams(server, user, keywords, values);
+        if (!conn || JQstatus(conn) != CONNECTION_OK)
         {
             char       *connmessage;
             int         msglen;
 
             /* libpq typically appends a newline, strip that */
-            connmessage = pstrdup(PQerrorMessage(conn));
+            connmessage = pstrdup(JQerrorMessage(conn));
             msglen = strlen(connmessage);
             if (msglen > 0 && connmessage[msglen - 1] == '\n')
                 connmessage[msglen - 1] = '\0';
@@ -247,7 +249,7 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
          * otherwise, he's piggybacking on the jdbc server's user
          * identity. See also dblink_security_check() in contrib/dblink.
          */
-        if (!superuser() && !PQconnectionUsedPassword(conn))
+        if (!superuser() && !JQconnectionUsedPassword(conn))
             ereport(ERROR,
                   (errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
                    errmsg("password is required"),
@@ -262,9 +264,9 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
     }
     PG_CATCH();
     {
-        /* Release PGconn data structure if we managed to create one */
+        /* Release Jconn data structure if we managed to create one */
         if (conn)
-            PQfinish(conn);
+            JQfinish(conn);
         PG_RE_THROW();
     }
     PG_END_TRY();
@@ -313,9 +315,9 @@ check_conn_params(const char **keywords, const char **values)
  * there are any number of ways to break things.
  */
 static void
-configure_remote_session(PGconn *conn)
+configure_remote_session(Jconn *conn)
 {
-    int         remoteversion = PQserverVersion(conn);
+    int         remoteversion = JQserverVersion(conn);
 
     /* Force the search path to contain only pg_catalog (see deparse.c) */
     do_sql_command(conn, "SET search_path = pg_catalog");
@@ -349,14 +351,14 @@ configure_remote_session(PGconn *conn)
  * Convenience subroutine to issue a non-data-returning SQL command to remote
  */
 static void
-do_sql_command(PGconn *conn, const char *sql)
+do_sql_command(Jconn *conn, const char *sql)
 {
-    PGresult   *res;
+    Jresult   *res;
 
-    res = PQexec(conn, sql);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK)
+    res = JQexec(conn, sql);
+    if (JQresultStatus(res) != PGRES_COMMAND_OK)
         pgfdw_report_error(ERROR, res, conn, true, sql);
-    PQclear(res);
+    JQclear(res);
 }
 
 /*
@@ -409,7 +411,7 @@ begin_remote_xact(ConnCacheEntry *entry)
  * Release connection reference count created by calling GetConnection.
  */
 void
-ReleaseConnection(PGconn *conn)
+ReleaseConnection(Jconn *conn)
 {
     /*
      * Currently, we don't actually track connection references because all
@@ -430,7 +432,7 @@ ReleaseConnection(PGconn *conn)
  * collisions are highly improbable; just be sure to use %u not %d to print.
  */
 unsigned int
-GetCursorNumber(PGconn *conn)
+GetCursorNumber(Jconn *conn)
 {
     return ++cursor_number;
 }
@@ -444,7 +446,7 @@ GetCursorNumber(PGconn *conn)
  * increasing the risk of prepared-statement name collisions by resetting.
  */
 unsigned int
-GetPrepStmtNumber(PGconn *conn)
+GetPrepStmtNumber(Jconn *conn)
 {
     return ++prep_stmt_number;
 }
@@ -453,9 +455,9 @@ GetPrepStmtNumber(PGconn *conn)
  * Report an error we got from the remote server.
  *
  * elevel: error level to use (typically ERROR, but might be less)
- * res: PGresult containing the error
+ * res: Jresult containing the error
  * conn: connection we did the query on
- * clear: if true, PQclear the result (otherwise caller will handle it)
+ * clear: if true, JQclear the result (otherwise caller will handle it)
  * sql: NULL, or text of remote command we tried to execute
  *
  * Note: callers that choose not to throw ERROR for a remote error are
@@ -463,17 +465,17 @@ GetPrepStmtNumber(PGconn *conn)
  * marked with have_error = true.
  */
 void
-pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
+pgfdw_report_error(int elevel, Jresult *res, Jconn *conn,
                    bool clear, const char *sql)
 {
-    /* If requested, PGresult must be released before leaving this function. */
+    /* If requested, Jresult must be released before leaving this function. */
     PG_TRY();
     {
-        char       *diag_sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
-        char       *message_primary = PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY);
-        char       *message_detail = PQresultErrorField(res, PG_DIAG_MESSAGE_DETAIL);
-        char       *message_hint = PQresultErrorField(res, PG_DIAG_MESSAGE_HINT);
-        char       *message_context = PQresultErrorField(res, PG_DIAG_CONTEXT);
+        char       *diag_sqlstate = JQresultErrorField(res, PG_DIAG_SQLSTATE);
+        char       *message_primary = JQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY);
+        char       *message_detail = JQresultErrorField(res, PG_DIAG_MESSAGE_DETAIL);
+        char       *message_hint = JQresultErrorField(res, PG_DIAG_MESSAGE_HINT);
+        char       *message_context = JQresultErrorField(res, PG_DIAG_CONTEXT);
         int         sqlstate;
 
         if (diag_sqlstate)
@@ -486,12 +488,12 @@ pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
             sqlstate = ERRCODE_CONNECTION_FAILURE;
 
         /*
-         * If we don't get a message from the PGresult, try the PGconn.  This
-         * is needed because for connection-level failures, PQexec may just
-         * return NULL, not a PGresult at all.
+         * If we don't get a message from the Jresult, try the Jconn.  This
+         * is needed because for connection-level failures, JQexec may just
+         * return NULL, not a Jresult at all.
          */
         if (message_primary == NULL)
-            message_primary = PQerrorMessage(conn);
+            message_primary = JQerrorMessage(conn);
 
         ereport(elevel,
                 (errcode(sqlstate),
@@ -505,12 +507,12 @@ pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
     PG_CATCH();
     {
         if (clear)
-            PQclear(res);
+            JQclear(res);
         PG_RE_THROW();
     }
     PG_END_TRY();
     if (clear)
-        PQclear(res);
+        JQclear(res);
 }
 
 /*
@@ -533,7 +535,7 @@ pgfdw_xact_callback(XactEvent event, void *arg)
     hash_seq_init(&scan, ConnectionHash);
     while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
     {
-        PGresult   *res;
+        Jresult   *res;
 
         /* Ignore cache entry if no open connection right now */
         if (entry->conn == NULL)
@@ -568,8 +570,8 @@ pgfdw_xact_callback(XactEvent event, void *arg)
                      */
                     if (entry->have_prep_stmt && entry->have_error)
                     {
-                        res = PQexec(entry->conn, "DEALLOCATE ALL");
-                        PQclear(res);
+                        res = JQexec(entry->conn, "DEALLOCATE ALL");
+                        JQclear(res);
                     }
                     entry->have_prep_stmt = false;
                     entry->have_error = false;
@@ -598,19 +600,19 @@ pgfdw_xact_callback(XactEvent event, void *arg)
                     /* Assume we might have lost track of prepared statements */
                     entry->have_error = true;
                     /* If we're aborting, abort all remote transactions too */
-                    res = PQexec(entry->conn, "ABORT TRANSACTION");
+                    res = JQexec(entry->conn, "ABORT TRANSACTION");
                     /* Note: can't throw ERROR, it would be infinite loop */
-                    if (PQresultStatus(res) != PGRES_COMMAND_OK)
+                    if (JQresultStatus(res) != PGRES_COMMAND_OK)
                         pgfdw_report_error(WARNING, res, entry->conn, true,
                                            "ABORT TRANSACTION");
                     else
                     {
-                        PQclear(res);
+                        JQclear(res);
                         /* As above, make sure to clear any prepared stmts */
                         if (entry->have_prep_stmt && entry->have_error)
                         {
-                            res = PQexec(entry->conn, "DEALLOCATE ALL");
-                            PQclear(res);
+                            res = JQexec(entry->conn, "DEALLOCATE ALL");
+                            JQclear(res);
                         }
                         entry->have_prep_stmt = false;
                         entry->have_error = false;
@@ -626,11 +628,11 @@ pgfdw_xact_callback(XactEvent event, void *arg)
          * If the connection isn't in a good idle state, discard it to
          * recover. Next GetConnection will open a new connection.
          */
-        if (PQstatus(entry->conn) != CONNECTION_OK ||
-            PQtransactionStatus(entry->conn) != PQTRANS_IDLE)
+        if (JQstatus(entry->conn) != CONNECTION_OK ||
+            JQtransactionStatus(entry->conn) != PQTRANS_IDLE)
         {
             elog(DEBUG3, "discarding connection %p", entry->conn);
-            PQfinish(entry->conn);
+            JQfinish(entry->conn);
             entry->conn = NULL;
         }
     }
@@ -674,7 +676,7 @@ pgfdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
     hash_seq_init(&scan, ConnectionHash);
     while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
     {
-        PGresult   *res;
+        Jresult   *res;
         char        sql[100];
 
         /*
@@ -702,11 +704,11 @@ pgfdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
             snprintf(sql, sizeof(sql),
                      "ROLLBACK TO SAVEPOINT s%d; RELEASE SAVEPOINT s%d",
                      curlevel, curlevel);
-            res = PQexec(entry->conn, sql);
-            if (PQresultStatus(res) != PGRES_COMMAND_OK)
+            res = JQexec(entry->conn, sql);
+            if (JQresultStatus(res) != PGRES_COMMAND_OK)
                 pgfdw_report_error(WARNING, res, entry->conn, true, sql);
             else
-                PQclear(res);
+                JQclear(res);
         }
 
         /* OK, we're outta that level of subtransaction */

@@ -19,23 +19,19 @@
 #include "utils/rel.h"
 
 #include "libpq-fe.h"
-
-/* JDBC connection, same role as PGconn */
-typedef struct {
-    char *url;
-} JConn;
+#include "jq.h"
 
 /* in jdbc2_fdw.c */
 extern int  set_transmission_modes(void);
 extern void reset_transmission_modes(int nestlevel);
 
 /* in connection.c */
-extern PGconn *GetConnection(ForeignServer *server, UserMapping *user,
+extern Jconn *GetConnection(ForeignServer *server, UserMapping *user,
               bool will_prep_stmt);
-extern void ReleaseConnection(PGconn *conn);
-extern unsigned int GetCursorNumber(PGconn *conn);
-extern unsigned int GetPrepStmtNumber(PGconn *conn);
-extern void pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
+extern void ReleaseConnection(Jconn *conn);
+extern unsigned int GetCursorNumber(Jconn *conn);
+extern unsigned int GetPrepStmtNumber(Jconn *conn);
+extern void pgfdw_report_error(int elevel, Jresult *res, Jconn *conn,
                    bool clear, const char *sql);
 
 /* in option.c */
