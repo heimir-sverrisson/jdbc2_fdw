@@ -34,10 +34,10 @@ PG_CPPFLAGS=-D'PKG_LIB_DIR=$(pkglibdir)' -I$(libpq_srcdir)
 
 JFLAGS = -d $(pkglibdir)
 
-# all:$(TRGTS)
+all:$(TRGTS)
 
-#JAVAFILES:
-#	javac $(JFLAGS) $(JAVA_SOURCES)
+JAVAFILES:
+	javac $(JFLAGS) $(JAVA_SOURCES)
 
 # the db name is hard-coded in the tests
 override USE_MODULE_DB =

@@ -36,6 +36,8 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/elog.h"
+
 
 #include "storage/ipc.h"
 #include "catalog/pg_foreign_server.h"
@@ -774,7 +776,7 @@ jdbcBeginForeignScan(ForeignScanState *node, int eflags)
     /* Get private info created by planner functions. */
     fsstate->query = strVal(list_nth(fsplan->fdw_private,
                                      FdwScanPrivateSelectSql));
-ereport(ERROR, (errmsg("\"local query = %s\"\n",fsstate->query)));
+ereport(DEBUG3, (errmsg("local query = \"%s\"",fsstate->query)));
     fsstate->retrieved_attrs = (List *) list_nth(fsplan->fdw_private,
                                                FdwScanPrivateRetrievedAttrs);
 
@@ -1858,6 +1860,9 @@ fetch_more_data(ForeignScanState *node)
     Jresult   *volatile res = NULL;
     MemoryContext oldcontext;
 
+    //TODO: Figure out what this is used for
+    return;
+
     /*
      * We'll store the tuples in the batch_cxt.  First, flush the previous
      * batch.
@@ -1981,6 +1986,9 @@ close_cursor(Jconn *conn, unsigned int cursor_number)
 {
     char        sql[64];
     Jresult   *res;
+
+    //TODO: Make sure I don't need this at all
+    return;
 
     snprintf(sql, sizeof(sql), "CLOSE c%u", cursor_number);
 

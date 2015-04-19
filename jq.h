@@ -10,10 +10,11 @@
 #define JQ_H
 
 #include "libpq-fe.h"
+#include "jni.h"
 
 /* JDBC connection, same role as PGconn */
 typedef struct {
-    char *url;
+    jclass JDBCUtilsClass;
     ConnStatusType status;
 } Jconn;
 

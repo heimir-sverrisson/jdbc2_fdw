@@ -20,6 +20,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "commands/defrem.h"
+#include "libpq-fe.h"
 
 #include "jni.h"
 
@@ -31,7 +32,7 @@
  * Local housekeeping functions and Java objects
  */
 
-static JNIEnv *env;
+static JNIEnv *Jenv;
 static JavaVM *jvm;
 jobject java_call;
 static bool InterruptFlag;   /* Used for checking for SIGINT interrupt */
@@ -56,10 +57,13 @@ typedef struct JserverOptions{
     int maxheapsize;
 } JserverOptions;
 
+static JserverOptions opts;
+
 /* Local function prototypes */
 static int connectDBComplete(Jconn *conn);
 static void JVMInit(const ForeignServer *server, const UserMapping *user);
 static void jdbcGetServerOptions(JserverOptions *opts, const ForeignServer *f_server, const UserMapping *f_mapping);
+static Jconn * createJDBCConnection(const ForeignServer *server, const UserMapping *user);
 /*
  * Uses a String object's content to create an instance of C String
  */
@@ -81,38 +85,33 @@ static void
 SIGINTInterruptCheckProcess()
 {
 
-    if (InterruptFlag == true)
-    {   
-        jclass      JDBCUtilsClass;
-        jmethodID   id_cancel;  
-        jstring     cancel_result = NULL;
-        char        *cancel_result_cstring = NULL;
+	if (InterruptFlag == true) {
+		jclass JDBCUtilsClass;
+		jmethodID id_cancel;
+		jstring cancel_result = NULL;
+		char *cancel_result_cstring = NULL;
 
-        JDBCUtilsClass = (*env)->FindClass(env, "JDBCUtils");
-        if (JDBCUtilsClass == NULL) 
-        {       
-            elog(ERROR, "JDBCUtilsClass is NULL");
-        }       
-
-        id_cancel = (*env)->GetMethodID(env, JDBCUtilsClass, "Cancel", "()Ljava/lang/String;");
-        if (id_cancel == NULL) 
-        {       
-            elog(ERROR, "id_cancel is NULL");
-        }       
-
-        cancel_result = (*env)->CallObjectMethod(env,java_call,id_cancel);
-        if (cancel_result != NULL)
-        {       
-            cancel_result_cstring = ConvertStringToCString((jobject)cancel_result);
-            elog(ERROR, "%s", cancel_result_cstring);
-        }       
-
-        InterruptFlag = false;
-        elog(ERROR, "Query has been cancelled");
-
-        (*env)->ReleaseStringUTFChars(env, cancel_result, cancel_result_cstring);
-        (*env)->DeleteLocalRef(env, cancel_result);
-    }   
+		JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
+		if (JDBCUtilsClass == NULL) {
+			elog(ERROR, "JDBCUtilsClass is NULL");
+		}
+		id_cancel = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "cancel",
+				"()Ljava/lang/String;");
+		if (id_cancel == NULL) {
+			elog(ERROR, "id_cancel is NULL");
+		}
+		cancel_result = (*Jenv)->CallObjectMethod(Jenv, java_call, id_cancel);
+		if (cancel_result != NULL) {
+			cancel_result_cstring = ConvertStringToCString(
+					(jobject) cancel_result);
+			elog(ERROR, "%s", cancel_result_cstring);
+		}
+		InterruptFlag = false;
+		elog(ERROR, "Query has been cancelled");
+		(*Jenv)->ReleaseStringUTFChars(Jenv, cancel_result,
+				cancel_result_cstring);
+		(*Jenv)->DeleteLocalRef(Jenv, cancel_result);
+	}
 }
 
 /*
@@ -121,24 +120,24 @@ SIGINTInterruptCheckProcess()
  *              create an instance of C String.
  */
 static char*
-ConvertStringToCString(jobject java_cstring)
-{
-        jclass  JavaString;
-        char    *StringPointer;
+ConvertStringToCString(jobject java_cstring) {
+	jclass JavaString;
+	char *StringPointer;
 
-        SIGINTInterruptCheckProcess();
+	SIGINTInterruptCheckProcess();
 
-        JavaString = (*env)->FindClass(env, "java/lang/String");
-        if (!((*env)->IsInstanceOf(env, java_cstring, JavaString))) {
-                elog(ERROR, "Object not an instance of String class");
-        }
+	JavaString = (*Jenv)->FindClass(Jenv, "java/lang/String");
+	if (!((*Jenv)->IsInstanceOf(Jenv, java_cstring, JavaString))) {
+		elog(ERROR, "Object not an instance of String class");
+	}
 
-        if (java_cstring != NULL) {
-                StringPointer = (char*)(*env)->GetStringUTFChars(env, (jstring)java_cstring, 0);
-        } else {
-                StringPointer = NULL;
-        }
-        return (StringPointer);
+	if (java_cstring != NULL) {
+		StringPointer = (char*) (*Jenv)->GetStringUTFChars(Jenv,
+				(jstring) java_cstring, 0);
+	} else {
+		StringPointer = NULL;
+	}
+	return (StringPointer);
 }
 
 /*
@@ -163,13 +162,12 @@ JVMInit(const ForeignServer *server, const UserMapping *user)
 {
     static bool FunctionCallCheck = false;   /* This flag safeguards against multiple calls of JVMInit() */
 
-    jint res = -5;/* Initializing the value of res so that we can check it later to see whether JVM has been correctly created or not */
+    jint res = -5;/* Set to a negative value so we can see whether JVM has been correctly created or not */
     JavaVMInitArgs  vm_args;
     JavaVMOption    *options;
     char strpkglibdir[] = STR_PKGLIBDIR;
     char *classpath;
     char *maxheapsizeoption = NULL;
-    JserverOptions opts;
     opts.maxheapsize = 0;
 
     jdbcGetServerOptions(&opts, server, user); // Get the maxheapsize value (if set)
@@ -198,7 +196,7 @@ JVMInit(const ForeignServer *server, const UserMapping *user)
         vm_args.ignoreUnrecognized = JNI_FALSE;
 
         /* Create the Java VM */
-        res = JNI_CreateJavaVM(&jvm, (void**)&env, &vm_args);
+        res = JNI_CreateJavaVM(&jvm, (void**)&Jenv, &vm_args);
         if (res < 0) {
             ereport(ERROR,
                  (errmsg("Failed to create Java VM")
@@ -210,6 +208,82 @@ JVMInit(const ForeignServer *server, const UserMapping *user)
         on_proc_exit(DestroyJVM, 0);
         FunctionCallCheck = true;
     }
+}
+
+/*
+ * Create an actual JDBC connection to the foreign server.
+ * Precondition: JVMInit() has been successfully called.
+ * Returns:
+ *      Jconn.status = CONNECTION_OK and a valid reference to a JDBCUtils class
+ * Error return:
+ *      Jconn.status = CONNECTION_BAD
+ */
+static Jconn *
+createJDBCConnection(const ForeignServer *server, const UserMapping *user)
+{
+    jmethodID idCreate;
+    jstring stringArray[6];
+    jclass javaString;
+    jobject javaCall;
+    jobjectArray argArray;
+    jstring connResult;
+    char *querytimeout_string;
+    char *cString = NULL;
+    int i;
+    int numParams = sizeof(stringArray)/sizeof(jstring); //Number of parameters to Java
+    int intSize = 10; // The string size to allocate for an integer value
+
+    // pfree() when connection is discarded in JQfinish()
+    Jconn *conn = (Jconn *)palloc(sizeof(Jconn));
+    conn->status = CONNECTION_BAD; // Be pessimistic
+    conn->JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
+    if(conn->JDBCUtilsClass == NULL){
+        ereport(ERROR, (errmsg("Failed to find the JDBCUtils class!")));
+    }
+    idCreate = (*Jenv)->GetMethodID(Jenv, conn->JDBCUtilsClass, "createConnection", 
+                                                "([Ljava/lang/String;)Ljava/lang/String;");
+    if(idCreate == NULL){
+        ereport(ERROR, (errmsg("Failed to find the JDBCUtils.createConnection method!")));
+    }
+    // Construct the array to pass our parameters
+    // Query timeout is an int, we need a string
+    querytimeout_string = (char *)palloc(intSize);
+    snprintf(querytimeout_string, intSize, "%d", opts.querytimeout);
+    stringArray[0] = (*Jenv)->NewStringUTF(Jenv, opts.drivername);
+    stringArray[1] = (*Jenv)->NewStringUTF(Jenv, opts.url);
+    stringArray[2] = (*Jenv)->NewStringUTF(Jenv, opts.username);
+    stringArray[3] = (*Jenv)->NewStringUTF(Jenv, opts.password);
+    stringArray[4] = (*Jenv)->NewStringUTF(Jenv, querytimeout_string);
+    stringArray[5] = (*Jenv)->NewStringUTF(Jenv, opts.jarfile);
+    // Set up the return value
+    javaString = (*Jenv)->FindClass(Jenv, "java/lang/String");
+    argArray = (*Jenv)->NewObjectArray(Jenv, numParams, javaString, stringArray[0]);
+    if(argArray == NULL){
+        ereport(ERROR, (errmsg("Failed to create argument array")));
+    }
+    for(i = 1; i < numParams; i++){
+        (*Jenv)->SetObjectArrayElement(Jenv, argArray, i, stringArray[i]);
+    }
+    javaCall = (*Jenv)->AllocObject(Jenv, conn->JDBCUtilsClass);
+    if(javaCall == NULL){
+        ereport(ERROR, (errmsg("Failed to create java call")));
+    }
+    connResult = NULL;
+    connResult = (*Jenv)->CallObjectMethod(Jenv, javaCall, idCreate, argArray);
+    if(connResult != NULL){  // Happy result is null
+        cString = ConvertStringToCString((jobject)connResult);
+        ereport(ERROR, (errmsg("%s", cString)));
+    }
+    // Return Java memory
+    for(i = 0; i < numParams; i++){
+        (*Jenv)->DeleteLocalRef(Jenv, stringArray[i]);
+    }
+    (*Jenv)->DeleteLocalRef(Jenv, argArray);
+    (*Jenv)->ReleaseStringUTFChars(Jenv, connResult, cString);
+    (*Jenv)->DeleteLocalRef(Jenv, connResult);
+    ereport(DEBUG3, (errmsg("Created a JDBC connection: %s",opts.url)));
+    conn->status = CONNECTION_OK;
+    return conn;
 }
 
 /*
@@ -231,8 +305,10 @@ jdbcGetServerOptions(JserverOptions *opts, const ForeignServer *f_server, const 
     {
         DefElem *def = (DefElem *) lfirst(lc);
 
+//      ereport(DEBUG3, (errmsg("Option %s",defGetString(def))));
+
         if (strcmp(def->defname, "drivername") == 0){
-             opts->drivername = defGetString(def);
+            opts->drivername = defGetString(def);
         }
         if (strcmp(def->defname, "username") == 0){
             opts->username = defGetString(def);
@@ -258,6 +334,7 @@ jdbcGetServerOptions(JserverOptions *opts, const ForeignServer *f_server, const 
 Jresult *
 JQexec(Jconn *conn, const char *query)
 {
+    ereport(DEBUG3, (errmsg("JQexec(%p): %s", conn, query)));
     return 0;
 }
 
@@ -266,6 +343,7 @@ JQexecPrepared(Jconn *conn, const char *stmtName, int nParams,
     const char *const *paramValues, const int *paramLengths,
     const int *paramFormats, int resultFormat)
 {
+	ereport(DEBUG3, (errmsg("In JQexecPrepared")));
     return 0;
 }
 
@@ -274,36 +352,42 @@ JQexecParams(Jconn *conn, const char *command,
     int nParams, const Oid *paramTypes, const char *const *paramValues,
     const int *paramLengths, const int *paramFormats, int resultFormat)
 {
+	ereport(DEBUG3, (errmsg("In JQexecParams: %s", command)));
     return 0;
 }
 
 ExecStatusType 
 JQresultStatus(const Jresult *res)
 {
+	ereport(DEBUG3, (errmsg("In JQresultStatus")));
     return PGRES_COMMAND_OK;
 }
 
 void
 JQclear(Jresult *res)
 {
+	ereport(DEBUG3, (errmsg("In JQclear")));
     return;
 }
 
 int
 JQntuples(const Jresult *res)
 {
+	ereport(DEBUG3, (errmsg("In JQntuples")));
     return 0;
 }
 
 char *
 JQcmdTuples(Jresult *res)
 {
+	ereport(DEBUG3, (errmsg("In JQcmdTuples")));
     return 0;
 }
 
 char *
 JQgetvalue(const Jresult *res, int tup_num, int field_num)
 {
+	ereport(DEBUG3, (errmsg("In JQgetvalue")));
     return 0;
 }
 
@@ -311,18 +395,21 @@ Jresult *
 JQprepare(Jconn *conn, const char *stmtName, const char *query,
     int nParams, const Oid *paramTypes)
 {
+	ereport(DEBUG3, (errmsg("In JQprepare")));
     return 0;
 }
 
 int 
 JQnfields(const Jresult *res)
 {
+	ereport(DEBUG3, (errmsg("In JQnfields")));
     return 0;
 }
 
 int 
 JQgetisnull(const Jresult *res, int tup_num, int field_num)
 {
+	ereport(DEBUG3, (errmsg("In JQgetisnull")));
     return 0;
 }
 
@@ -344,7 +431,7 @@ JQconnectdbParams(const ForeignServer *server, const UserMapping *user,
     }
     /* Initialize the Java JVM (if it has not been done already) */
     JVMInit(server, user);
-    conn = 0;
+    conn = createJDBCConnection(server, user);
     if(JQstatus(conn) == CONNECTION_BAD){
         (void) connectDBComplete(conn);
     }
@@ -358,12 +445,14 @@ JQconnectdbParams(const ForeignServer *server, const UserMapping *user,
 static int
 connectDBComplete(Jconn *conn)
 {
+	ereport(DEBUG3, (errmsg("In connectDBComplete")));
     return 0;
 }
 
 ConnStatusType 
 JQstatus(const Jconn *conn)       
 {
+	ereport(DEBUG3, (errmsg("In JQstatus for conn=%p",conn)));
     if(!conn){
         return CONNECTION_BAD;
     }
@@ -373,35 +462,43 @@ JQstatus(const Jconn *conn)
 char *
 JQerrorMessage(const Jconn *conn)
 {
-    return 0;
+	ereport(DEBUG3, (errmsg("In JQerrorMessage")));
+    return "Unknown Error!";
 }
 
 int 
 JQconnectionUsedPassword(const Jconn *conn)
 {
+	ereport(DEBUG3, (errmsg("In JQconnectionUsedPassword")));
     return 0;
 }
 
 void
 JQfinish(Jconn *conn)
 {
+	ereport(DEBUG3, (errmsg("In JQfinish for conn=%p", conn)));
+	pfree(conn);
+	conn = NULL;
     return;
 }
 
 int
 JQserverVersion(const Jconn *conn)
 {
+	ereport(DEBUG3, (errmsg("In JQserverVersion")));
     return 0;
 }
 
 char *
 JQresultErrorField(const Jresult *res, int fieldcode)
 {
+	ereport(DEBUG3, (errmsg("In JQresultErrorField")));
     return 0;
 }
 
 PGTransactionStatusType
 JQtransactionStatus(const Jconn *conn)
 {
+	ereport(DEBUG3, (errmsg("In JQtransactionStatus")));
     return PQTRANS_UNKNOWN;
 }
