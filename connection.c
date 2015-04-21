@@ -123,7 +123,7 @@ GetConnection(ForeignServer *server, UserMapping *user,
         RegisterXactCallback(pgfdw_xact_callback, NULL);
         RegisterSubXactCallback(pgfdw_subxact_callback, NULL);
     }
-ereport(DEBUG3, (errmsg("\"Added server = %s to hashtable\"\n",server->servername)));
+ereport(DEBUG3, (errmsg("Added server = %s to hashtable",server->servername)));
 
     /* Set flag that we did GetConnection during the current transaction */
     xact_got_connection = true;

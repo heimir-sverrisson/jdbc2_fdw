@@ -49,6 +49,10 @@ public class T
         return jdbcUtils.closeConnection();
     }
 
+    private void printNumberOfColumns(){
+        System.out.println("Number of columns: " + jdbcUtils.getNumberOfColumns());
+    }
+
     private void report(String s, String operation){
         if(s == null){
             System.out.println("Successful " + operation);
@@ -64,9 +68,11 @@ public class T
         T t = new T();
         t.report(t.createConnection(), "createConnection");
         t.report(t.createStatement(query1), "createStatement");
+        t.printNumberOfColumns();
         t.iterate();
         t.report(t.closeStatement(), "closeStatement");
         t.report(t.createStatement(query2), "createStatement");
+        t.printNumberOfColumns();
         t.iterate();
         t.report(t.closeConnection(), "closeConnection");
         t.report(t.createStatement(query2), "createStatement");

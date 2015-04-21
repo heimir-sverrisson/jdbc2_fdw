@@ -224,9 +224,9 @@ createJDBCConnection(const ForeignServer *server, const UserMapping *user)
     jmethodID idCreate;
     jstring stringArray[6];
     jclass javaString;
-    jobject javaCall;
     jobjectArray argArray;
     jstring connResult;
+    jclass JDBCUtilsClass;
     char *querytimeout_string;
     char *cString = NULL;
     int i;
@@ -236,11 +236,15 @@ createJDBCConnection(const ForeignServer *server, const UserMapping *user)
     // pfree() when connection is discarded in JQfinish()
     Jconn *conn = (Jconn *)palloc(sizeof(Jconn));
     conn->status = CONNECTION_BAD; // Be pessimistic
-    conn->JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
-    if(conn->JDBCUtilsClass == NULL){
+    conn->festate = (jdbcFdwExecutionState *) palloc(sizeof(jdbcFdwExecutionState));
+    conn->festate->query = NULL;
+    conn->festate->NumberOfRows = 0;
+    conn->festate->NumberOfColumns = 0;
+    JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
+    if(JDBCUtilsClass == NULL){
         ereport(ERROR, (errmsg("Failed to find the JDBCUtils class!")));
     }
-    idCreate = (*Jenv)->GetMethodID(Jenv, conn->JDBCUtilsClass, "createConnection", 
+    idCreate = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "createConnection",
                                                 "([Ljava/lang/String;)Ljava/lang/String;");
     if(idCreate == NULL){
         ereport(ERROR, (errmsg("Failed to find the JDBCUtils.createConnection method!")));
@@ -264,12 +268,12 @@ createJDBCConnection(const ForeignServer *server, const UserMapping *user)
     for(i = 1; i < numParams; i++){
         (*Jenv)->SetObjectArrayElement(Jenv, argArray, i, stringArray[i]);
     }
-    javaCall = (*Jenv)->AllocObject(Jenv, conn->JDBCUtilsClass);
-    if(javaCall == NULL){
+    conn->utilsObject = (*Jenv)->AllocObject(Jenv, JDBCUtilsClass);
+    if(conn->utilsObject == NULL){
         ereport(ERROR, (errmsg("Failed to create java call")));
     }
     connResult = NULL;
-    connResult = (*Jenv)->CallObjectMethod(Jenv, javaCall, idCreate, argArray);
+    connResult = (*Jenv)->CallObjectMethod(Jenv, conn->utilsObject, idCreate, argArray);
     if(connResult != NULL){  // Happy result is null
         cString = ConvertStringToCString((jobject)connResult);
         ereport(ERROR, (errmsg("%s", cString)));
@@ -334,8 +338,113 @@ jdbcGetServerOptions(JserverOptions *opts, const ForeignServer *f_server, const 
 Jresult *
 JQexec(Jconn *conn, const char *query)
 {
-    ereport(DEBUG3, (errmsg("JQexec(%p): %s", conn, query)));
-    return 0;
+	jmethodID idCreateStatement;
+	jstring statement;
+	jstring returnValue;
+	jclass JDBCUtilsClass;
+	jfieldID idNumberOfColumns;
+	char *cString = NULL;
+	Jresult *res;
+
+	ereport(DEBUG3, (errmsg("JQexec(%p): %s", conn, query)));
+    // Our object of the JDBCUtils class is on the connection
+    if(conn->utilsObject == NULL){
+        ereport(ERROR, (errmsg("utilsObject is not on connection! Has the connection not been created?")));
+    }
+	//TODO: Need to reclaim this memory
+	res = (Jresult *)palloc(sizeof(Jresult));
+	res->resultStatus = PGRES_FATAL_ERROR; // Be pessimistic
+
+    JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
+	if(JDBCUtilsClass == NULL){
+        ereport(ERROR, (errmsg("JDBCUtils class could not be created")));
+    }
+    idCreateStatement = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "createStatement",
+                                                "(Ljava/lang/String;)Ljava/lang/String;");
+    if(idCreateStatement == NULL){
+        ereport(ERROR, (errmsg("Failed to find the JDBCUtils.createStatement method!")));
+    }
+    // The query argument
+    statement = (*Jenv)->NewStringUTF(Jenv, query);
+    if(statement == NULL){
+        ereport(ERROR, (errmsg("Failed to create query argument")));
+    }
+    returnValue = NULL;
+    returnValue = (*Jenv)->CallObjectMethod(Jenv, conn->utilsObject, idCreateStatement, statement);
+    if(returnValue != NULL){  // Happy return Value is null
+        cString = ConvertStringToCString((jobject)returnValue);
+        ereport(ERROR, (errmsg("%s", cString)));
+    }
+    // Set up the execution state
+    idNumberOfColumns = (*Jenv)->GetFieldID(Jenv, JDBCUtilsClass, "numberOfColumns" , "I");
+    if (idNumberOfColumns == NULL){
+            ereport(ERROR, (errmsg("Cannot read the number of columns")));
+    }
+    conn->festate->NumberOfColumns = (*Jenv)->GetIntField(Jenv, conn->utilsObject, idNumberOfColumns);
+    // Return Java memory
+    (*Jenv)->DeleteLocalRef(Jenv, statement);
+    (*Jenv)->ReleaseStringUTFChars(Jenv, returnValue, cString);
+    (*Jenv)->DeleteLocalRef(Jenv, returnValue);
+    res->resultStatus = PGRES_COMMAND_OK;
+    return res;
+}
+
+/*
+ * JQiterate:
+ * 		Read the next row from the remote server
+ */
+TupleTableSlot *
+JQiterate(Jconn *conn, ForeignScanState *node){
+	jobject utilsObject;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	jclass JDBCUtilsClass;
+	jmethodID idResultSet;
+	jobjectArray rowArray;
+	char **values;
+	int numberOfColumns;
+	int i;
+	HeapTuple tuple;
+	jstring tempString;
+
+	numberOfColumns = conn->festate->NumberOfColumns;
+	utilsObject = conn->utilsObject;
+	if(utilsObject == NULL){
+		ereport(ERROR, (errmsg("Cannot get the utilsObject from the connection")));
+	}
+	// Cleanup
+	ExecClearTuple(slot);
+	SIGINTInterruptCheckProcess();
+	if((*Jenv)->PushLocalFrame(Jenv, (numberOfColumns + 10)) < 0){
+		ereport(ERROR, (errmsg("Error pushing local java frame")));
+	}
+    JDBCUtilsClass = (*Jenv)->FindClass(Jenv, "JDBCUtils");
+	if(JDBCUtilsClass == NULL){
+        ereport(ERROR, (errmsg("JDBCUtils class could not be created")));
+    }
+    idResultSet = (*Jenv)->GetMethodID(Jenv, JDBCUtilsClass, "returnResultSet", "()[Ljava/lang/String;");
+    if(idResultSet == NULL){
+        ereport(ERROR, (errmsg("Failed to find the JDBCUtils.returnResultSet method!")));
+    }
+	// Allocate pointers to the row data
+    values=(char **)palloc(numberOfColumns * sizeof(char *));
+    rowArray = (*Jenv)->CallObjectMethod(Jenv, utilsObject, idResultSet);
+    if(rowArray != NULL){
+    	for(i=0; i < numberOfColumns; i++){
+    		values[i] = ConvertStringToCString((jobject)(*Jenv)->GetObjectArrayElement(Jenv, rowArray, i));
+    	}
+    	tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att), values);
+    	ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+    	++(conn->festate->NumberOfRows);
+    	// Take out the garbage
+    	for(i=0; i < numberOfColumns; i++){
+    		tempString = (jstring)(*Jenv)->GetObjectArrayElement(Jenv, rowArray,i);
+    		(*Jenv)->ReleaseStringUTFChars(Jenv, tempString, values[i]);
+    		(*Jenv)->DeleteLocalRef(Jenv, tempString);
+    	}
+    	(*Jenv)->DeleteLocalRef(Jenv, rowArray);
+    }
+    (*Jenv)->PopLocalFrame(Jenv, NULL);
+    return(slot);
 }
 
 Jresult *
@@ -352,15 +461,22 @@ JQexecParams(Jconn *conn, const char *command,
     int nParams, const Oid *paramTypes, const char *const *paramValues,
     const int *paramLengths, const int *paramFormats, int resultFormat)
 {
-	ereport(DEBUG3, (errmsg("In JQexecParams: %s", command)));
-    return 0;
+	Jresult *res;
+
+	ereport(DEBUG3, (errmsg("In JQexecParams: %s, %d", command, nParams)));
+	res = JQexec(conn, command);
+	if(res->resultStatus != PGRES_COMMAND_OK){
+		ereport(ERROR, (errmsg("JQexec returns %d", res->resultStatus)));
+		return res;
+	}
+    return res;
 }
 
 ExecStatusType 
 JQresultStatus(const Jresult *res)
 {
 	ereport(DEBUG3, (errmsg("In JQresultStatus")));
-    return PGRES_COMMAND_OK;
+    return res->resultStatus;
 }
 
 void
@@ -422,10 +538,8 @@ JQconnectdbParams(const ForeignServer *server, const UserMapping *user,
     while(keywords[i]){
         const char *pkey = keywords[i];
         const char *pvalue = values[i];
-        if(pvalue != NULL && pvalue[0] != '\0'){
-            ereport(DEBUG3, (errmsg("(key, value) = (%s, %s)", pkey, pvalue)));
-        } else {
-            break; // No more values
+        if(pvalue == NULL && pvalue[0] == '\0'){
+        	break;
         }
         i++;
     }
@@ -452,7 +566,6 @@ connectDBComplete(Jconn *conn)
 ConnStatusType 
 JQstatus(const Jconn *conn)       
 {
-	ereport(DEBUG3, (errmsg("In JQstatus for conn=%p",conn)));
     if(!conn){
         return CONNECTION_BAD;
     }

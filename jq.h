@@ -11,15 +11,27 @@
 
 #include "libpq-fe.h"
 #include "jni.h"
+#include "executor/tuptable.h"
+#include "nodes/execnodes.h"
+
+typedef struct jdbcFdwExecutionState
+{
+        char            *query;
+        int             NumberOfRows;
+        int             NumberOfColumns;
+} jdbcFdwExecutionState;
 
 /* JDBC connection, same role as PGconn */
-typedef struct {
-    jclass JDBCUtilsClass;
+typedef struct Jconn {
+    jobject utilsObject;
     ConnStatusType status;
+    jdbcFdwExecutionState *festate;
 } Jconn;
 
 /* Same thing for Jresult replacing PGresult */
-typedef struct Jresult{int res;} Jresult;
+typedef struct Jresult{
+	ExecStatusType resultStatus;
+} Jresult;
 /*
  * Replacement for libpq-fe.h functions
  */
@@ -48,5 +60,6 @@ extern void JQfinish(Jconn *conn);
 extern int JQserverVersion(const Jconn *conn);
 extern char* JQresultErrorField(const Jresult *res, int fieldcode);
 extern PGTransactionStatusType JQtransactionStatus(const Jconn *conn);
+extern TupleTableSlot *JQiterate(Jconn *conn, ForeignScanState *node);
 
 #endif /* JQ_H */

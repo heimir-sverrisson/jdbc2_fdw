@@ -225,4 +225,13 @@ public class JDBCUtils
     {
         return closeStatement();
     }
+
+    /*
+     * getNumberOfColumns: A simple getter for the field numberOfColumns
+     */
+    public int 
+    getNumberOfColumns()
+    {
+        return numberOfColumns;
+    }
 }

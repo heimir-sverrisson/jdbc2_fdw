@@ -256,7 +256,7 @@ static ForeignScan *jdbcGetForeignPlan(PlannerInfo *root,
                        List *tlist,
                        List *scan_clauses);
 static void jdbcBeginForeignScan(ForeignScanState *node, int eflags);
-static TupleTableSlot *postgresIterateForeignScan(ForeignScanState *node);
+static TupleTableSlot *jdbcIterateForeignScan(ForeignScanState *node);
 static void postgresReScanForeignScan(ForeignScanState *node);
 static void postgresEndForeignScan(ForeignScanState *node);
 static void postgresAddForeignUpdateTargets(Query *parsetree,
@@ -352,7 +352,7 @@ jdbc2_fdw_handler(PG_FUNCTION_ARGS)
     routine->GetForeignPaths = jdbcGetForeignPaths;
     routine->GetForeignPlan = jdbcGetForeignPlan;
     routine->BeginForeignScan = jdbcBeginForeignScan;
-    routine->IterateForeignScan = postgresIterateForeignScan;
+    routine->IterateForeignScan = jdbcIterateForeignScan;
     routine->ReScanForeignScan = postgresReScanForeignScan;
     routine->EndForeignScan = postgresEndForeignScan;
 
@@ -391,6 +391,8 @@ jdbcGetForeignRelSize(PlannerInfo *root,
     PgFdwRelationInfo *fpinfo;
     ListCell   *lc;
 
+    //TODO: remove this functionality and support for remote statistics
+    ereport(DEBUG3, (errmsg("In jdbcGetForeignRelSize")));
     /*
      * We use PgFdwRelationInfo to pass various information to subsequent
      * functions.
@@ -546,7 +548,9 @@ jdbcGetForeignPaths(PlannerInfo *root,
                         RelOptInfo *baserel,
                         Oid foreigntableid)
 {
-    PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) baserel->fdw_private;
+    ereport(DEBUG3, (errmsg("In jdbcGetForeignPaths")));
+
+	PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) baserel->fdw_private;
     ForeignPath *path;
 
     /*
@@ -583,6 +587,7 @@ jdbcGetForeignPlan(PlannerInfo *root,
                        List *tlist,
                        List *scan_clauses)
 {
+    ereport(DEBUG3, (errmsg("In jdbcGetForeignPlan")));
     PgFdwRelationInfo *fpinfo = (PgFdwRelationInfo *) baserel->fdw_private;
     Index       scan_relid = baserel->relid;
     List       *fdw_private;
@@ -593,7 +598,6 @@ jdbcGetForeignPlan(PlannerInfo *root,
     StringInfoData sql;
     ListCell   *lc;
 
-//    JVMInitialization(foreigntableid);
     /*
      * Separate the scan_clauses into those that can be executed remotely and
      * those that can't.  baserestrictinfo clauses that were previously
@@ -613,8 +617,6 @@ jdbcGetForeignPlan(PlannerInfo *root,
      * local_exprs list, since appendWhereClause expects a list of
      * RestrictInfos.
      */
-
-//ereport(ERROR, (errmsg("\"baserel = %s\"\n",nodeToString(baserel))));
 
     foreach(lc, scan_clauses)
     {
@@ -644,9 +646,8 @@ jdbcGetForeignPlan(PlannerInfo *root,
     deparseSelectSql(&sql, root, baserel, fpinfo->attrs_used,
                      &retrieved_attrs);
     //if (remote_conds)
-        appendWhereClause(&sql, root, baserel, remote_conds,
+    appendWhereClause(&sql, root, baserel, remote_conds,
                           true, &params_list);
-
     /*
      * Add FOR UPDATE/SHARE if appropriate.  We apply locking during the
      * initial row fetch, rather than later on as is done for local tables.
@@ -716,13 +717,31 @@ jdbcGetForeignPlan(PlannerInfo *root,
                             fdw_private);
 }
 
+static char *
+replace_str(char *str, char *orig, char *rep)
+{
+  static char buffer[8192];
+  char *p;
+
+  if(!(p = strstr(str, orig)))  // Is 'orig' even in 'str'?
+    return str;
+
+  strncpy(buffer, str, p-str); // Copy characters from 'str' start to 'orig' st$
+  buffer[p-str] = '\0';
+
+  sprintf(buffer+(p-str), "%s%s", rep, p+strlen(orig));
+
+  return buffer;
+}
+
 /*
  * jdbcBeginForeignScan
- *      Initiate an executor scan of a foreign PostgreSQL table.
+ *      Initiate an executor scan of a foreign JDBC SQL table.
  */
 static void
 jdbcBeginForeignScan(ForeignScanState *node, int eflags)
 {
+    ereport(DEBUG3, (errmsg("In jdbcBeginForeignScan")));
     ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
     EState     *estate = node->ss.ps.state;
     PgFdwScanState *fsstate;
@@ -734,6 +753,7 @@ jdbcBeginForeignScan(ForeignScanState *node, int eflags)
     int         numParams;
     int         i;
     ListCell   *lc;
+    char *new_query;
 
     /*
      * Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL.
@@ -776,7 +796,9 @@ jdbcBeginForeignScan(ForeignScanState *node, int eflags)
     /* Get private info created by planner functions. */
     fsstate->query = strVal(list_nth(fsplan->fdw_private,
                                      FdwScanPrivateSelectSql));
-ereport(DEBUG3, (errmsg("local query = \"%s\"",fsstate->query)));
+    //TODO: Remove this hack with code that properly replaces the reference to the remote table
+    new_query = replace_str(fsstate->query,"public.f_utilities","staging.sta_utilities");
+    fsstate->query = new_query;
     fsstate->retrieved_attrs = (List *) list_nth(fsplan->fdw_private,
                                                FdwScanPrivateRetrievedAttrs);
 
@@ -831,48 +853,22 @@ ereport(DEBUG3, (errmsg("local query = \"%s\"",fsstate->query)));
         fsstate->param_values = (const char **) palloc0(numParams * sizeof(char *));
     else
         fsstate->param_values = NULL;
+    (void)JQexec(fsstate->conn, fsstate->query);
 }
 
 /*
- * postgresIterateForeignScan
+ * jdbcIterateForeignScan
  *      Retrieve next row from the result set, or clear tuple slot to indicate
  *      EOF.
  */
 static TupleTableSlot *
-postgresIterateForeignScan(ForeignScanState *node)
+jdbcIterateForeignScan(ForeignScanState *node)
 {
     PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
-    TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+    TupleTableSlot *slot;
 
-    /*
-     * If this is the first call after Begin or ReScan, we need to create the
-     * cursor on the remote side.
-     */
-    if (!fsstate->cursor_exists)
-        create_cursor(node);
-
-    /*
-     * Get some more tuples, if we've run out.
-     */
-    if (fsstate->next_tuple >= fsstate->num_tuples)
-    {
-        /* No point in another fetch if we already detected EOF, though. */
-        if (!fsstate->eof_reached)
-            fetch_more_data(node);
-        /* If we didn't get any tuples, must be end of data. */
-        if (fsstate->next_tuple >= fsstate->num_tuples)
-            return ExecClearTuple(slot);
-    }
-
-    /*
-     * Return the next tuple.
-     */
-    ExecStoreTuple(fsstate->tuples[fsstate->next_tuple++],
-                   slot,
-                   InvalidBuffer,
-                   false);
-
-    return slot;
+    slot = JQiterate(fsstate->conn, node);
+    return node->ss.ss_ScanTupleSlot;
 }
 
 /*
@@ -882,7 +878,8 @@ postgresIterateForeignScan(ForeignScanState *node)
 static void
 postgresReScanForeignScan(ForeignScanState *node)
 {
-    PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
+    ereport(DEBUG3, (errmsg("In postgresReScanForeignScan")));
+	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
     char        sql[64];
     Jresult   *res;
 
@@ -938,6 +935,7 @@ postgresReScanForeignScan(ForeignScanState *node)
 static void
 postgresEndForeignScan(ForeignScanState *node)
 {
+    ereport(DEBUG3, (errmsg("In postgresEndForeignScan")));
     PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
 
     /* if fsstate is NULL, we are in EXPLAIN; nothing to do */
@@ -1819,8 +1817,10 @@ create_cursor(ForeignScanState *node)
 
     /* Construct the DECLARE CURSOR command */
     initStringInfo(&buf);
-    appendStringInfo(&buf, "DECLARE c%u CURSOR FOR\n%s",
-                     fsstate->cursor_number, fsstate->query);
+    appendStringInfo(&buf, "%s", fsstate->query);
+
+    //appendStringInfo(&buf, "DECLARE c%u CURSOR FOR\n%s",
+    //                 fsstate->cursor_number, fsstate->query);
 
     /*
      * Notice that we pass NULL for paramTypes, thus forcing the remote server
