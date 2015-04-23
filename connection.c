@@ -162,8 +162,6 @@ ereport(DEBUG3, (errmsg("Added server = %s to hashtable",server->servername)));
         entry->have_prep_stmt = false;
         entry->have_error = false;
         entry->conn = connect_jdbc_server(server, user);
-        elog(DEBUG3, "new jdbc2_fdw connection %p for server \"%s\"",
-             entry->conn, server->servername);
     }
 
     /*

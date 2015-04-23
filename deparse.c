@@ -1160,13 +1160,18 @@ deparseRelation(StringInfo buf, Relation rel)
 	 * Note: we could skip printing the schema name if it's pg_catalog, but
 	 * that doesn't seem worth the trouble.
 	 */
-	if (nspname == NULL)
+	if (nspname == NULL){
 		nspname = get_namespace_name(RelationGetNamespace(rel));
-	if (relname == NULL)
+	}
+	if (relname == NULL){
 		relname = RelationGetRelationName(rel);
+	}
 
-	appendStringInfo(buf, "%s.%s",
-					 quote_identifier(nspname), quote_identifier(relname));
+	if(strlen(nspname) == 0){ // schema_name '', will omit the schema from the object name
+		appendStringInfo(buf, "%s", quote_identifier(relname));
+	} else {
+		appendStringInfo(buf, "%s.%s", quote_identifier(nspname), quote_identifier(relname));
+	}
 }
 
 /*
@@ -1399,10 +1404,12 @@ deparseConst(Const *node, deparse_expr_cxt *context)
 			needlabel = true;
 			break;
 	}
+	/*
 	if (needlabel)
 		appendStringInfo(buf, "::%s",
 						 format_type_with_typemod(node->consttype,
 												  node->consttypmod));
+	*/
 }
 
 /*

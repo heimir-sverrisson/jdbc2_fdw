@@ -645,9 +645,11 @@ jdbcGetForeignPlan(PlannerInfo *root,
     initStringInfo(&sql);
     deparseSelectSql(&sql, root, baserel, fpinfo->attrs_used,
                      &retrieved_attrs);
-    //if (remote_conds)
-    appendWhereClause(&sql, root, baserel, remote_conds,
-                          true, &params_list);
+	if (remote_conds) {
+		appendWhereClause(&sql, root, baserel, remote_conds,
+		true, &params_list);
+	}
+    ereport(DEBUG3, (errmsg("SQL: %s",sql.data)));
     /*
      * Add FOR UPDATE/SHARE if appropriate.  We apply locking during the
      * initial row fetch, rather than later on as is done for local tables.
@@ -717,23 +719,6 @@ jdbcGetForeignPlan(PlannerInfo *root,
                             fdw_private);
 }
 
-static char *
-replace_str(char *str, char *orig, char *rep)
-{
-  static char buffer[8192];
-  char *p;
-
-  if(!(p = strstr(str, orig)))  // Is 'orig' even in 'str'?
-    return str;
-
-  strncpy(buffer, str, p-str); // Copy characters from 'str' start to 'orig' st$
-  buffer[p-str] = '\0';
-
-  sprintf(buffer+(p-str), "%s%s", rep, p+strlen(orig));
-
-  return buffer;
-}
-
 /*
  * jdbcBeginForeignScan
  *      Initiate an executor scan of a foreign JDBC SQL table.
@@ -741,7 +726,6 @@ replace_str(char *str, char *orig, char *rep)
 static void
 jdbcBeginForeignScan(ForeignScanState *node, int eflags)
 {
-    ereport(DEBUG3, (errmsg("In jdbcBeginForeignScan")));
     ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
     EState     *estate = node->ss.ps.state;
     PgFdwScanState *fsstate;
@@ -755,12 +739,12 @@ jdbcBeginForeignScan(ForeignScanState *node, int eflags)
     ListCell   *lc;
     char *new_query;
 
+    ereport(DEBUG3, (errmsg("In jdbcBeginForeignScan")));
     /*
      * Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL.
      */
     if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
         return;
-
     /*
      * We'll save private state in node->fdw_state.
      */
@@ -783,6 +767,7 @@ jdbcBeginForeignScan(ForeignScanState *node, int eflags)
     // user->options contain username and password of the remote user
     user = GetUserMapping(userid, server->serverid);
 
+    ereport(DEBUG3, (errmsg("Local table: %s", RelationGetRelationName(fsstate->rel))));
     /*
      * Get connection to the foreign server.  Connection manager will
      * establish new connection if necessary.
@@ -796,9 +781,6 @@ jdbcBeginForeignScan(ForeignScanState *node, int eflags)
     /* Get private info created by planner functions. */
     fsstate->query = strVal(list_nth(fsplan->fdw_private,
                                      FdwScanPrivateSelectSql));
-    //TODO: Remove this hack with code that properly replaces the reference to the remote table
-    new_query = replace_str(fsstate->query,"public.f_utilities","staging.sta_utilities");
-    fsstate->query = new_query;
     fsstate->retrieved_attrs = (List *) list_nth(fsplan->fdw_private,
                                                FdwScanPrivateRetrievedAttrs);
 

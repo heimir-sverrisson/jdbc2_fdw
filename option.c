@@ -149,8 +149,6 @@ InitJdbcFdwOptions(void)
         { "maxheapsize",        ForeignServerRelationId, false },
         { "username",           UserMappingRelationId, false },
         { "password",           UserMappingRelationId, false },
-        { "query",              ForeignTableRelationId, false },
-        { "table",              ForeignTableRelationId, false },
         /* use_remote_estimate is available on both server and table */
         {"use_remote_estimate", ForeignServerRelationId, false},
         {"use_remote_estimate", ForeignTableRelationId, false},
@@ -160,6 +158,10 @@ InitJdbcFdwOptions(void)
         /* updatable is available on both server and table */
         {"updatable", ForeignServerRelationId, false},
         {"updatable", ForeignTableRelationId, false},
+		{"schema_name", ForeignTableRelationId, false},
+		{"table_name", ForeignTableRelationId, false},
+		{"column_name", AttributeRelationId, false},
+		{"use_remote_estimate", ForeignTableRelationId, false},
         {NULL, InvalidOid, false}
     };
 
